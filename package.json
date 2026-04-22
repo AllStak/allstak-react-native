@@ -1,7 +1,7 @@
 {
   "name": "@allstak/react-native",
   "version": "0.1.1",
-  "description": "AllStak React Native SDK — ErrorUtils + Hermes rejection tracking + device tags. Depends on @allstak/core. Native Android/iOS crash capture modules in ./native.",
+  "description": "AllStak React Native SDK \u2014 ErrorUtils + Hermes rejection tracking + device tags. Depends on @allstak/core. Native Android/iOS crash capture modules in ./native.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -12,7 +12,12 @@
       "require": "./dist/index.js"
     }
   },
-  "files": ["dist", "native", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "native",
+    "README.md",
+    "LICENSE"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -22,7 +27,13 @@
   "bugs": {
     "url": "https://github.com/abdualziz-urnt/allstak-react-native/issues"
   },
-  "keywords": ["allstak", "observability", "react-native", "mobile", "error-tracking"],
+  "keywords": [
+    "allstak",
+    "observability",
+    "react-native",
+    "mobile",
+    "error-tracking"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -33,11 +44,13 @@
     "react-native": ">=0.70"
   },
   "peerDependenciesMeta": {
-    "react-native": { "optional": true }
+    "react-native": {
+      "optional": true
+    }
   },
   "dependencies": {
-    "@allstak/core": "^0.1.1",
-    "allstak-js": "^0.1.1"
+    "@allstak/core": "github:abdualziz-urnt/allstak-core",
+    "allstak-js": "github:abdualziz-urnt/allstak-js"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
