@@ -21,7 +21,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/abdualziz-urnt/allstak-react-native.git"
+    "url": "https://github.com/allstak-io/allstak-react-native.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
@@ -49,8 +49,8 @@
     }
   },
   "dependencies": {
-    "@allstak/core": "github:abdualziz-urnt/allstak-core",
-    "allstak-js": "github:abdualziz-urnt/allstak-js"
+    "@allstak/core": "github:allstak-io/allstak-core",
+    "allstak-js": "github:allstak-io/allstak-js"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
