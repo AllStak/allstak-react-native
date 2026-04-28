@@ -17,6 +17,7 @@
 
 import { AllStak, __safeAddBreadcrumbForInstrumentation as safeBc } from './client';
 import { instrumentFetch, instrumentConsole } from './auto-breadcrumbs';
+import { applyArchitectureTags } from './architecture';
 
 // React Native runs CommonJS, so `require` is always present at runtime.
 // Declared here (instead of pulling @types/node) so consumers don't inherit
@@ -25,8 +26,12 @@ declare const require: (id: string) => any;
 
 export { AllStak } from './client';
 export type { AllStakConfig, Breadcrumb } from './client';
-export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION } from './client';
+export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
 export { instrumentReactNavigation, instrumentNavigationFromLinking } from './navigation';
+export { ReplaySurrogate } from './replay-surrogate';
+export type { ReplaySurrogateOptions } from './replay-surrogate';
+export { detectArchitecture, applyArchitectureTags } from './architecture';
+export type { ArchitectureInfo } from './architecture';
 
 type ErrorUtilsShape = {
   getGlobalHandler: () => (error: Error, isFatal?: boolean) => void;
@@ -165,6 +170,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
   const autoNetwork = options.autoNetworkCapture !== false;
 
   AllStak.setTag('platform', 'react-native');
+  try { applyArchitectureTags((k, v) => AllStak.setTag(k, v)); } catch { /* ignore */ }
 
   // Stamp SDK identity + auto-detected dist (ios-hermes / android-jsc / …).
   try {
@@ -180,7 +186,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
     } catch { /* not running under RN */ }
     AllStak.setIdentity({
       sdkName: 'allstak-react-native',
-      sdkVersion: '0.1.4',
+      sdkVersion: '0.2.0',
       platform: 'react-native',
       dist,
     });
