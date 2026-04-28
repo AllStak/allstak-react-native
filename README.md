@@ -3,7 +3,7 @@
 **Native crash + JS error capture for React Native. iOS and Android auto-wired.**
 
 [![npm version](https://img.shields.io/npm/v/@allstak/react-native.svg)](https://www.npmjs.com/package/@allstak/react-native)
-[![CI](https://github.com/allstak-io/allstak-react-native/actions/workflows/ci.yml/badge.svg)](https://github.com/allstak-io/allstak-react-native/actions)
+[![CI](https://github.com/AllStak/allstak-react-native/actions/workflows/ci.yml/badge.svg)](https://github.com/AllStak/allstak-react-native/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Official AllStak SDK for React Native — hooks `ErrorUtils`, Hermes rejection tracking, and native crash capture on iOS and Android.
@@ -151,7 +151,7 @@ Add this as a release-only step in your CI; the runtime SDK reads the
 
 - Documentation: https://docs.allstak.sa
 - Dashboard: https://app.allstak.sa
-- Source: https://github.com/allstak-io/allstak-react-native
+- Source: https://github.com/AllStak/allstak-react-native
 
 ## License
 

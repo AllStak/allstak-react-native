@@ -15,7 +15,7 @@ import { ReplaySurrogate, ReplaySurrogateOptions } from './replay-surrogate';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.2.0';
+export const SDK_VERSION = '0.2.1';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';

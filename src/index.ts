@@ -186,7 +186,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
     } catch { /* not running under RN */ }
     AllStak.setIdentity({
       sdkName: 'allstak-react-native',
-      sdkVersion: '0.2.0',
+      sdkVersion: '0.2.1',
       platform: 'react-native',
       dist,
     });

@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write   # required for npm OIDC trusted publisher
     steps:
       - uses: actions/checkout@v4
 
@@ -38,10 +39,15 @@ jobs:
           fi
           echo "Version match: $PKG_VERSION"
 
-      - name: Publish to npm
-        run: npm publish --access public
+      # Two paths: OIDC trusted publisher (preferred — no long-lived token,
+      # bypasses the 2FA-on-writes lockout) AND a fall-through to NPM_TOKEN
+      # so this still publishes if the trusted publisher is not yet configured
+      # on npm. The CLI prefers OIDC when both are available.
+      - name: Publish to npm (OIDC trusted publisher + token fallback)
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'true'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
