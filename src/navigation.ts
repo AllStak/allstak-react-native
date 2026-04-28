@@ -27,11 +27,34 @@ type NavigationRef = {
 const NAV_FLAG = Symbol.for('allstak.nav.subscribed');
 const LINKING_FLAG = '__allstak_linking_patched__';
 
+export interface ReactNavigationOptions {
+  /**
+   * Whitelist of route-param keys safe to record alongside the route name.
+   * Anything outside this list is dropped — params commonly carry user IDs,
+   * order numbers, etc. Default `[]`.
+   */
+  safeParams?: string[];
+  /**
+   * Also forward the screen view to the replay surrogate (if active).
+   * Default true — the surrogate itself decides whether it's recording.
+   */
+  forwardToReplay?: boolean;
+}
+
 /**
  * Subscribe to a `@react-navigation/native` NavigationContainerRef and
- * emit a navigation breadcrumb whenever the active route name changes.
+ * emit a navigation breadcrumb whenever the active route changes. Captures:
+ *
+ *   - route name change (from -> to)
+ *   - whitelisted route params (via `safeParams`)
+ *   - state change → forwarded to replay surrogate when enabled
+ *
+ * Idempotent — installs once per ref. Returns an unsubscribe function.
  */
-export function instrumentReactNavigation(navigationRef: NavigationRef): () => void {
+export function instrumentReactNavigation(
+  navigationRef: NavigationRef,
+  options: ReactNavigationOptions = {},
+): () => void {
   if (!navigationRef || typeof navigationRef.addListener !== 'function') {
     return () => {};
   }
@@ -39,14 +62,33 @@ export function instrumentReactNavigation(navigationRef: NavigationRef): () => v
   if (ref[NAV_FLAG]) return () => {};
   ref[NAV_FLAG] = true;
 
+  const safeKeys = options.safeParams ?? [];
+  const forwardToReplay = options.forwardToReplay !== false;
+
+  const filterParams = (params: Record<string, unknown> | undefined): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    if (!params) return out;
+    for (const key of safeKeys) if (key in params) out[key] = (params as any)[key];
+    return out;
+  };
+
   let last: string | undefined = navigationRef.getCurrentRoute?.()?.name;
   const unsub = navigationRef.addListener('state', () => {
-    const next = navigationRef.getCurrentRoute?.()?.name;
+    const route = navigationRef.getCurrentRoute?.();
+    const next = route?.name;
     if (!next || next === last) return;
+    const safe = filterParams((route as any)?.params);
     try {
       AllStak.addBreadcrumb('navigation', `${last ?? '<start>'} -> ${next}`, 'info',
-        { from: last, to: next });
+        { from: last, to: next, params: safe });
     } catch { /* never break host */ }
+
+    if (forwardToReplay) {
+      try {
+        const replay = (AllStak as any).getReplay?.();
+        replay?.recordScreenView?.(next, (route as any)?.params);
+      } catch { /* ignore */ }
+    }
     last = next;
   });
   return () => {

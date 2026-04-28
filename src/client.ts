@@ -9,10 +9,17 @@
 
 import { HttpTransport } from './transport';
 import { parseStack } from './stack';
+import { Scope, mergeScopes } from './scope';
+import { TracingModule, Span } from './tracing';
+import { ReplaySurrogate, ReplaySurrogateOptions } from './replay-surrogate';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.1.4';
+export const SDK_VERSION = '0.2.0';
+
+export { Scope } from './scope';
+export { Span, TracingModule } from './tracing';
+export type { SpanData } from './tracing';
 
 const ERRORS_PATH = '/ingest/v1/errors';
 const LOGS_PATH = '/ingest/v1/logs';
@@ -37,15 +44,26 @@ export interface AllStakConfig {
   /**
    * Default severity level for events that don't specify their own.
    * Affects `captureException` (sets `payload.level`) and the default of
-   * `captureMessage`. Sentry parity with `Sentry.setLevel`.
+   * `captureMessage`. Customer-set default severity, mirrors `setLevel`.
    */
   level?: 'fatal' | 'error' | 'warning' | 'info' | 'debug';
   /**
    * Custom grouping fingerprint applied to every event. The backend uses
-   * this in place of stack-based grouping. Sentry parity with
-   * `Sentry.setFingerprint`. Pass an empty array or `null` to clear.
+   * this in place of stack-based grouping. Customer-set grouping override —
+   * `setFingerprint`. Pass an empty array or `null` to clear.
    */
   fingerprint?: string[];
+  /** Probability in [0, 1] that any new span is recorded. Default 1. */
+  tracesSampleRate?: number;
+  /** Service name attached to every span (defaults to release if unset). */
+  service?: string;
+  /**
+   * Privacy-first view-state replay surrogate. **Off by default.** Enable
+   * with `replay: { sampleRate: 0.1, safeParams: ['screenId'] }`. Captures
+   * route names + AppState transitions + manual checkpoints — never inputs
+   * or rendered text. See `src/replay-surrogate.ts` for the privacy contract.
+   */
+  replay?: ReplaySurrogateOptions;
   maxBreadcrumbs?: number;
   /**
    * Probability in [0, 1] that any given error is sent. Default: 1 (no sampling).
@@ -126,6 +144,9 @@ export class AllStakClient {
   private sessionId: string;
   private breadcrumbs: Breadcrumb[] = [];
   private maxBreadcrumbs: number;
+  private scopeStack: Scope[] = [];
+  private tracing: TracingModule;
+  private replay: ReplaySurrogate | null = null;
 
   constructor(config: AllStakConfig) {
     if (!config.apiKey) {
@@ -140,7 +161,21 @@ export class AllStakClient {
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;
     const baseUrl = (config.host ?? INGEST_HOST).replace(/\/$/, '');
     this.transport = new HttpTransport(baseUrl, config.apiKey);
+    this.tracing = new TracingModule(this.transport, {
+      service: config.service ?? config.release ?? '',
+      environment: this.config.environment ?? 'production',
+      tracesSampleRate: config.tracesSampleRate,
+    });
+    if (config.replay && (config.replay.enabled ?? true)) {
+      try {
+        this.replay = new ReplaySurrogate(this.transport, this.sessionId, config.replay);
+        this.replay.start();
+      } catch { /* never break init */ }
+    }
   }
+
+  /** Access the replay surrogate (or null if not initialized / sampled out). */
+  getReplay(): ReplaySurrogate | null { return this.replay; }
 
   // ── Public API ────────────────────────────────────────────────────
 
@@ -163,6 +198,13 @@ export class AllStakClient {
       (error.name && error.name !== 'Error' ? error.name : undefined) ||
       error.constructor?.name ||
       'Error';
+    const eff = this.effective();
+    const traceContext: Record<string, unknown> = {};
+    const traceId = this.tracing.getTraceId();
+    if (traceId) traceContext.traceId = traceId;
+    const spanId = this.tracing.getCurrentSpanId();
+    if (spanId) traceContext.spanId = spanId;
+
     const payload: ErrorIngestPayload = {
       exceptionClass,
       message: error.message,
@@ -172,18 +214,31 @@ export class AllStakClient {
       sdkName: this.config.sdkName,
       sdkVersion: this.config.sdkVersion,
       dist: this.config.dist,
-      level: this.config.level ?? 'error',
+      level: eff.level ?? 'error',
       environment: this.config.environment,
       release: this.config.release,
       sessionId: this.sessionId,
-      user: this.config.user,
-      metadata: this.buildMetadata(context),
+      user: eff.user,
+      metadata: { ...this.buildMetadata(context), ...traceContext },
       breadcrumbs: currentBreadcrumbs,
-      fingerprint: this.config.fingerprint,
+      fingerprint: eff.fingerprint,
     };
 
     this.sendThroughBeforeSend(payload);
   }
+
+  /** Start a new span. Auto-parented to any currently-active span. */
+  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
+    return this.tracing.startSpan(operation, options);
+  }
+  /** Get (and lazily create) the active trace ID. */
+  getTraceId(): string { return this.tracing.getTraceId(); }
+  /** Override the active trace ID, e.g. from an inbound request header. */
+  setTraceId(traceId: string): void { this.tracing.setTraceId(traceId); }
+  /** ID of the currently-active span, or null. */
+  getCurrentSpanId(): string | null { return this.tracing.getCurrentSpanId(); }
+  /** Reset the trace ID and the active span stack. */
+  resetTrace(): void { this.tracing.resetTrace(); }
 
   captureMessage(
     message: string,
@@ -196,6 +251,7 @@ export class AllStakClient {
     }
     if (as === 'error' || as === 'both') {
       if (!this.passesSampleRate()) return;
+      const eff = this.effective();
       const payload: ErrorIngestPayload = {
         exceptionClass: 'Message',
         message,
@@ -207,9 +263,9 @@ export class AllStakClient {
         environment: this.config.environment,
         release: this.config.release,
         sessionId: this.sessionId,
-        user: this.config.user,
+        user: eff.user,
         metadata: this.buildMetadata(),
-        fingerprint: this.config.fingerprint,
+        fingerprint: eff.fingerprint,
       };
       this.sendThroughBeforeSend(payload);
     }
@@ -307,6 +363,8 @@ export class AllStakClient {
   getConfig(): AllStakConfig { return this.config; }
 
   destroy(): void {
+    this.tracing.destroy();
+    if (this.replay) { this.replay.destroy(); this.replay = null; }
     this.breadcrumbs = [];
   }
 
@@ -334,19 +392,65 @@ export class AllStakClient {
     return Math.random() < r;
   }
 
+  /**
+   * Returns the effective config layer = base config + every scope on the
+   * stack. Inner code reads from this instead of `this.config` directly so
+   * scope-only overrides (set inside `withScope`) flow into the wire
+   * payload without leaking out of the callback.
+   */
+  private effective(): AllStakConfig {
+    return mergeScopes(this.config, this.scopeStack);
+  }
+
   private buildMetadata(perCallContext?: Record<string, unknown>): Record<string, unknown> {
+    const eff = this.effective();
     const out: Record<string, unknown> = {
       ...this.releaseTags(),
-      ...this.config.tags,
-      ...(this.config.extras ?? {}),
+      ...eff.tags,
+      ...(eff.extras ?? {}),
       ...(perCallContext ?? {}),
     };
-    if (this.config.contexts) {
-      for (const [name, ctx] of Object.entries(this.config.contexts)) {
+    if (eff.contexts) {
+      for (const [name, ctx] of Object.entries(eff.contexts)) {
         out[`context.${name}`] = ctx;
       }
     }
     return out;
+  }
+
+  /**
+   * Run `callback` with a fresh, temporary {@link Scope} that isolates
+   * any user/tag/extra/context/fingerprint/level it sets. The scope is
+   * popped automatically when the callback returns or throws — including
+   * for `Promise`-returning callbacks (the pop runs in `.finally`).
+   *
+   * Use this on the server to attach per-request context without leaking
+   * across concurrent requests.
+   */
+  withScope<T>(callback: (scope: Scope) => T): T {
+    const scope = new Scope();
+    this.scopeStack.push(scope);
+    let popped = false;
+    const pop = () => { if (!popped) { popped = true; this.scopeStack.pop(); } };
+    try {
+      const result = callback(scope);
+      if (result && typeof (result as any).then === 'function') {
+        return (result as any).then(
+          (v: any) => { pop(); return v; },
+          (e: any) => { pop(); throw e; },
+        );
+      }
+      pop();
+      return result;
+    } catch (err) {
+      pop();
+      throw err;
+    }
+  }
+
+  /** Direct access to the topmost active scope, or null. @internal */
+  getCurrentScope(): Scope | null {
+    return this.scopeStack[this.scopeStack.length - 1] ?? null;
   }
 
   private async sendThroughBeforeSend(payload: ErrorIngestPayload): Promise<void> {
@@ -427,6 +531,22 @@ export const AllStak = {
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
     ensureInit().setIdentity(identity);
   },
+  /**
+   * Run `callback` with a fresh scoped context. Any user/tag/extra/context/
+   * fingerprint/level set on the passed `Scope` is visible only inside the
+   * callback (and any captures made within it). Pop is automatic, including
+   * for async callbacks and thrown errors.
+   */
+  withScope<T>(callback: (scope: Scope) => T): T { return ensureInit().withScope(callback); },
+  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
+    return ensureInit().startSpan(operation, options);
+  },
+  getTraceId(): string { return ensureInit().getTraceId(); },
+  setTraceId(traceId: string): void { ensureInit().setTraceId(traceId); },
+  getCurrentSpanId(): string | null { return ensureInit().getCurrentSpanId(); },
+  resetTrace(): void { ensureInit().resetTrace(); },
+  /** Access the privacy-first replay surrogate (or null if disabled / sampled out). */
+  getReplay(): ReplaySurrogate | null { return ensureInit().getReplay(); },
   getSessionId(): string { return ensureInit().getSessionId(); },
   getConfig(): AllStakConfig | null { return instance?.getConfig() ?? null; },
   destroy(): void { instance?.destroy(); instance = null; },
