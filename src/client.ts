@@ -30,7 +30,24 @@ export interface AllStakConfig {
   release?: string;
   user?: { id?: string; email?: string };
   tags?: Record<string, string>;
+  /** Per-event extra data attached to every capture (override per call via context arg). */
+  extras?: Record<string, unknown>;
+  /** Named context bags (e.g. `app`, `device`). Each lives under `metadata['context.<name>']`. */
+  contexts?: Record<string, Record<string, unknown>>;
   maxBreadcrumbs?: number;
+  /**
+   * Probability in [0, 1] that any given error is sent. Default: 1 (no sampling).
+   * Applied per event before {@link beforeSend}.
+   */
+  sampleRate?: number;
+  /**
+   * Mutate or drop an event before it is sent. Return `null` (or a falsy
+   * value) to drop. Sync or async. Errors thrown inside the hook are caught
+   * — the event is sent as-is so a buggy hook can't black-hole telemetry.
+   */
+  beforeSend?: (event: ErrorIngestPayload) =>
+    | ErrorIngestPayload | null | undefined
+    | Promise<ErrorIngestPayload | null | undefined>;
   /** SDK identity overrides (set automatically by installReactNative). */
   sdkName?: string;
   sdkVersion?: string;
@@ -58,7 +75,7 @@ interface PayloadFrame {
   platform?: string;
 }
 
-interface ErrorIngestPayload {
+export interface ErrorIngestPayload {
   exceptionClass: string;
   message: string;
   stackTrace?: string[];
@@ -115,6 +132,7 @@ export class AllStakClient {
   // ── Public API ────────────────────────────────────────────────────
 
   captureException(error: Error, context?: Record<string, unknown>): void {
+    if (!this.passesSampleRate()) return;
     const frames = parseStack(error.stack).map((f) => ({
       ...f,
       platform: this.config.platform,
@@ -138,11 +156,11 @@ export class AllStakClient {
       release: this.config.release,
       sessionId: this.sessionId,
       user: this.config.user,
-      metadata: { ...this.releaseTags(), ...this.config.tags, ...(context ?? {}) },
+      metadata: this.buildMetadata(context),
       breadcrumbs: currentBreadcrumbs,
     };
 
-    this.transport.send(ERRORS_PATH, payload);
+    this.sendThroughBeforeSend(payload);
   }
 
   captureMessage(
@@ -155,6 +173,7 @@ export class AllStakClient {
       this.sendLog(level === 'warning' ? 'warn' : level, message);
     }
     if (as === 'error' || as === 'both') {
+      if (!this.passesSampleRate()) return;
       const payload: ErrorIngestPayload = {
         exceptionClass: 'Message',
         message,
@@ -167,9 +186,9 @@ export class AllStakClient {
         release: this.config.release,
         sessionId: this.sessionId,
         user: this.config.user,
-        metadata: { ...this.releaseTags(), ...this.config.tags },
+        metadata: this.buildMetadata(),
       };
-      this.transport.send(ERRORS_PATH, payload);
+      this.sendThroughBeforeSend(payload);
     }
   }
 
@@ -203,6 +222,43 @@ export class AllStakClient {
     this.config.tags[key] = value;
   }
 
+  /** Bulk-set tags. Merges with existing tags. */
+  setTags(tags: Record<string, string>): void {
+    if (!this.config.tags) this.config.tags = {};
+    Object.assign(this.config.tags, tags);
+  }
+
+  /** Set a single extra value. */
+  setExtra(key: string, value: unknown): void {
+    if (!this.config.extras) this.config.extras = {};
+    this.config.extras[key] = value;
+  }
+
+  /** Bulk-set extras. Merges with existing extras. */
+  setExtras(extras: Record<string, unknown>): void {
+    if (!this.config.extras) this.config.extras = {};
+    Object.assign(this.config.extras, extras);
+  }
+
+  /**
+   * Attach a named context bag (e.g. `app`, `device`, `runtime`) — appears
+   * under `metadata['context.<name>']` on every subsequent event. Pass
+   * `null` to remove a previously-set context.
+   */
+  setContext(name: string, ctx: Record<string, unknown> | null): void {
+    if (!this.config.contexts) this.config.contexts = {};
+    if (ctx === null) delete this.config.contexts[name];
+    else this.config.contexts[name] = ctx;
+  }
+
+  /**
+   * Wait for the in-flight retry-buffer to drain. Resolves `true` if the
+   * buffer empties within `timeoutMs` (default 2000ms), `false` otherwise.
+   */
+  flush(timeoutMs?: number): Promise<boolean> {
+    return this.transport.flush(timeoutMs);
+  }
+
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
     if (identity.sdkName) this.config.sdkName = identity.sdkName;
     if (identity.sdkVersion) this.config.sdkVersion = identity.sdkVersion;
@@ -231,8 +287,40 @@ export class AllStakClient {
       platform: this.config.platform,
       sdkName: this.config.sdkName,
       sdkVersion: this.config.sdkVersion,
-      metadata: { ...this.releaseTags(), ...this.config.tags },
+      metadata: this.buildMetadata(),
     });
+  }
+
+  private passesSampleRate(): boolean {
+    const r = this.config.sampleRate;
+    if (typeof r !== 'number' || r >= 1) return true;
+    if (r <= 0) return false;
+    return Math.random() < r;
+  }
+
+  private buildMetadata(perCallContext?: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      ...this.releaseTags(),
+      ...this.config.tags,
+      ...(this.config.extras ?? {}),
+      ...(perCallContext ?? {}),
+    };
+    if (this.config.contexts) {
+      for (const [name, ctx] of Object.entries(this.config.contexts)) {
+        out[`context.${name}`] = ctx;
+      }
+    }
+    return out;
+  }
+
+  private async sendThroughBeforeSend(payload: ErrorIngestPayload): Promise<void> {
+    let final: ErrorIngestPayload | null | undefined = payload;
+    if (this.config.beforeSend) {
+      try { final = await this.config.beforeSend(payload); }
+      catch { final = payload; /* never let a buggy hook drop telemetry */ }
+    }
+    if (!final) return;
+    this.transport.send(ERRORS_PATH, final);
   }
 
   private releaseTags(): Record<string, unknown> {
@@ -278,6 +366,11 @@ export const AllStak = {
   clearBreadcrumbs(): void { ensureInit().clearBreadcrumbs(); },
   setUser(user: { id?: string; email?: string }): void { ensureInit().setUser(user); },
   setTag(key: string, value: string): void { ensureInit().setTag(key, value); },
+  setTags(tags: Record<string, string>): void { ensureInit().setTags(tags); },
+  setExtra(key: string, value: unknown): void { ensureInit().setExtra(key, value); },
+  setExtras(extras: Record<string, unknown>): void { ensureInit().setExtras(extras); },
+  setContext(name: string, ctx: Record<string, unknown> | null): void { ensureInit().setContext(name, ctx); },
+  flush(timeoutMs?: number): Promise<boolean> { return ensureInit().flush(timeoutMs); },
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
     ensureInit().setIdentity(identity);
   },

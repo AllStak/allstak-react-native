@@ -70,4 +70,20 @@ export class HttpTransport {
   getBufferSize(): number {
     return this.buffer.length;
   }
+
+  /**
+   * Wait for the in-flight retry-buffer to drain. Resolves `true` if the
+   * buffer empties within `timeoutMs` (default 2000ms), `false` otherwise.
+   * Useful before navigation away or during native crash drain.
+   */
+  async flush(timeoutMs = 2000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    await this.flushBuffer();
+    while (this.buffer.length > 0 || this.flushing) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 25));
+      await this.flushBuffer();
+    }
+    return true;
+  }
 }
