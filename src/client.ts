@@ -34,6 +34,18 @@ export interface AllStakConfig {
   extras?: Record<string, unknown>;
   /** Named context bags (e.g. `app`, `device`). Each lives under `metadata['context.<name>']`. */
   contexts?: Record<string, Record<string, unknown>>;
+  /**
+   * Default severity level for events that don't specify their own.
+   * Affects `captureException` (sets `payload.level`) and the default of
+   * `captureMessage`. Sentry parity with `Sentry.setLevel`.
+   */
+  level?: 'fatal' | 'error' | 'warning' | 'info' | 'debug';
+  /**
+   * Custom grouping fingerprint applied to every event. The backend uses
+   * this in place of stack-based grouping. Sentry parity with
+   * `Sentry.setFingerprint`. Pass an empty array or `null` to clear.
+   */
+  fingerprint?: string[];
   maxBreadcrumbs?: number;
   /**
    * Probability in [0, 1] that any given error is sent. Default: 1 (no sampling).
@@ -91,6 +103,7 @@ export interface ErrorIngestPayload {
   user?: { id?: string; email?: string };
   metadata?: Record<string, unknown>;
   breadcrumbs?: Breadcrumb[];
+  fingerprint?: string[];
 }
 
 function frameToString(f: PayloadFrame): string {
@@ -142,8 +155,16 @@ export class AllStakClient {
     const currentBreadcrumbs = this.breadcrumbs.length > 0 ? [...this.breadcrumbs] : undefined;
     this.breadcrumbs = [];
 
+    // Prefer an explicit `error.name` override (e.g. native crashes set
+    // it to 'NSException'); fall back to constructor name then to 'Error'.
+    // `new Error()` always has constructor.name === 'Error', so an explicit
+    // name set after construction would otherwise be silently dropped.
+    const exceptionClass =
+      (error.name && error.name !== 'Error' ? error.name : undefined) ||
+      error.constructor?.name ||
+      'Error';
     const payload: ErrorIngestPayload = {
-      exceptionClass: error.constructor?.name || error.name || 'Error',
+      exceptionClass,
       message: error.message,
       stackTrace,
       frames: frames.length > 0 ? frames : undefined,
@@ -151,13 +172,14 @@ export class AllStakClient {
       sdkName: this.config.sdkName,
       sdkVersion: this.config.sdkVersion,
       dist: this.config.dist,
-      level: 'error',
+      level: this.config.level ?? 'error',
       environment: this.config.environment,
       release: this.config.release,
       sessionId: this.sessionId,
       user: this.config.user,
       metadata: this.buildMetadata(context),
       breadcrumbs: currentBreadcrumbs,
+      fingerprint: this.config.fingerprint,
     };
 
     this.sendThroughBeforeSend(payload);
@@ -187,6 +209,7 @@ export class AllStakClient {
         sessionId: this.sessionId,
         user: this.config.user,
         metadata: this.buildMetadata(),
+        fingerprint: this.config.fingerprint,
       };
       this.sendThroughBeforeSend(payload);
     }
@@ -257,6 +280,19 @@ export class AllStakClient {
    */
   flush(timeoutMs?: number): Promise<boolean> {
     return this.transport.flush(timeoutMs);
+  }
+
+  /** Set the default severity level applied to subsequent captures. */
+  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void {
+    this.config.level = level;
+  }
+
+  /**
+   * Set a custom grouping fingerprint applied to subsequent events.
+   * Pass `null` or an empty array to clear and revert to default grouping.
+   */
+  setFingerprint(fingerprint: string[] | null): void {
+    this.config.fingerprint = fingerprint && fingerprint.length > 0 ? fingerprint : undefined;
   }
 
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
@@ -344,6 +380,21 @@ function ensureInit(): AllStakClient {
   return instance;
 }
 
+/**
+ * Module-level breadcrumb forwarder used by auto-instrumentation wrappers
+ * (fetch/console/navigation) so they always target the current `instance`
+ * after re-init, and silently no-op when there is none.
+ */
+export function __safeAddBreadcrumbForInstrumentation(
+  type: string,
+  message: string,
+  level?: string,
+  data?: Record<string, unknown>,
+): void {
+  try { instance?.addBreadcrumb(type, message, level, data); }
+  catch { /* never break host */ }
+}
+
 export const AllStak = {
   init(config: AllStakConfig): AllStakClient {
     if (instance) instance.destroy();
@@ -370,6 +421,8 @@ export const AllStak = {
   setExtra(key: string, value: unknown): void { ensureInit().setExtra(key, value); },
   setExtras(extras: Record<string, unknown>): void { ensureInit().setExtras(extras); },
   setContext(name: string, ctx: Record<string, unknown> | null): void { ensureInit().setContext(name, ctx); },
+  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void { ensureInit().setLevel(level); },
+  setFingerprint(fingerprint: string[] | null): void { ensureInit().setFingerprint(fingerprint); },
   flush(timeoutMs?: number): Promise<boolean> { return ensureInit().flush(timeoutMs); },
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
     ensureInit().setIdentity(identity);

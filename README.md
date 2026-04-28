@@ -109,6 +109,44 @@ Production endpoint: `https://api.allstak.sa`. Override via `host` for self-host
 installReactNative({ apiKey: '...', host: 'https://allstak.mycorp.com' });
 ```
 
+## Source maps (Hermes / Metro)
+
+JS bundles produced by Metro (with or without Hermes) are minified in
+release builds — without source-map upload, your dashboard stacks will
+read like `at e (index.bundle:1:42031)`. Wire it up once during release
+build via `@allstak/js/sourcemaps` (devDependency only):
+
+```bash
+npm install -D @allstak/js
+```
+
+```sh
+# Build the release bundle as you normally would
+npx react-native bundle \
+  --platform android --dev false --entry-file index.js \
+  --bundle-output android-release.bundle \
+  --sourcemap-output android-release.bundle.map
+
+# Hermes-compile (if Hermes is enabled — the default on RN 0.70+)
+hermes-compiler --emit-binary --output-source-map \
+  -out android-release.hbc android-release.bundle
+
+# Upload to AllStak — debugId injection + map upload
+node -e "import('@allstak/js/sourcemaps').then(({ processBuildOutput }) => \
+  processBuildOutput({ dir: '.', release: process.env.RELEASE, \
+    token: process.env.ALLSTAK_UPLOAD_TOKEN }))"
+```
+
+For iOS (`react-native bundle --platform ios`) the same flow applies.
+Add this as a release-only step in your CI; the runtime SDK reads the
+`debugId` from each frame and resolves the matching map server-side.
+
+> **Status:** the upload pipeline is the same one used by the web SDK
+> and is unit-tested in `@allstak/js/tests/sourcemaps-*.test.ts`. Native
+> Hermes-bytecode mapping has not yet been integration-tested end-to-end
+> against the AllStak symbolicator on a real device build — flag any
+> off-by-one source maps in [issues](https://github.com/AllStak/allstak-react-native/issues).
+
 ## Links
 
 - Documentation: https://docs.allstak.sa

@@ -15,7 +15,8 @@
  * under the `native/` directory in this package. See README.
  */
 
-import { AllStak } from './client';
+import { AllStak, __safeAddBreadcrumbForInstrumentation as safeBc } from './client';
+import { instrumentFetch, instrumentConsole } from './auto-breadcrumbs';
 
 // React Native runs CommonJS, so `require` is always present at runtime.
 // Declared here (instead of pulling @types/node) so consumers don't inherit
@@ -25,6 +26,7 @@ declare const require: (id: string) => any;
 export { AllStak } from './client';
 export type { AllStakConfig, Breadcrumb } from './client';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION } from './client';
+export { instrumentReactNavigation, instrumentNavigationFromLinking } from './navigation';
 
 type ErrorUtilsShape = {
   getGlobalHandler: () => (error: Error, isFatal?: boolean) => void;
@@ -42,6 +44,10 @@ export interface ReactNativeInstallOptions {
   autoAppStateBreadcrumbs?: boolean;
   /** Auto-instrument XHR (RN's fetch is XHR-based) for network breadcrumbs. Default: true */
   autoNetworkCapture?: boolean;
+  /** Wrap `globalThis.fetch` to record HTTP breadcrumbs. Default: true */
+  autoFetchBreadcrumbs?: boolean;
+  /** Wrap `console.warn`/`console.error` to record log breadcrumbs. Default: true */
+  autoConsoleBreadcrumbs?: boolean;
 }
 
 /**
@@ -101,15 +107,30 @@ function instrumentXmlHttpRequest(): void {
 }
 
 /**
+ * Test seam — set a fake native module to be returned by
+ * `drainPendingNativeCrashes` instead of `require('react-native').NativeModules.AllStakNative`.
+ * Pass `null` to clear. Production callers must NOT use this.
+ *
+ * @internal
+ */
+let __testNativeModule: any = null;
+export function __setNativeModuleForTest(mod: any): void {
+  __testNativeModule = mod;
+}
+
+/**
  * Drain any native crash stashed by AllStakCrashHandler on the previous
  * launch and ship it to /ingest/v1/errors. No-op when the native module
  * is not linked (Expo Go, JS-only test runners, etc).
  */
 export async function drainPendingNativeCrashes(release?: string): Promise<void> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const rn = require('react-native');
-    const native: any = rn?.NativeModules?.AllStakNative;
+    let native: any = __testNativeModule;
+    if (!native) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const rn = require('react-native');
+      native = rn?.NativeModules?.AllStakNative;
+    }
     if (!native) return;
     if (typeof native.install === 'function') {
       try { await native.install(release ?? ''); } catch { /* ignore */ }
@@ -167,6 +188,18 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
 
   if (autoNetwork) {
     try { instrumentXmlHttpRequest(); } catch { /* not in JS env */ }
+  }
+
+  if (options.autoFetchBreadcrumbs !== false) {
+    try {
+      const cfg = AllStak.getConfig();
+      const ownBaseUrl = (cfg?.host ?? 'https://api.allstak.sa').replace(/\/$/, '');
+      instrumentFetch(safeBc, ownBaseUrl);
+    } catch { /* never break init */ }
+  }
+  if (options.autoConsoleBreadcrumbs !== false) {
+    try { instrumentConsole(safeBc); }
+    catch { /* never break init */ }
   }
 
   if (autoDevice) {
