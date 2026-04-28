@@ -1,6 +1,6 @@
 {
   "name": "@allstak/react-native",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AllStak React Native SDK — standalone error tracking, breadcrumbs, network capture, and ErrorUtils + Hermes rejection hooks. No browser or Node dependencies. Native Android/iOS crash modules in ./native.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

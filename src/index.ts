@@ -32,6 +32,9 @@ export { ReplaySurrogate } from './replay-surrogate';
 export type { ReplaySurrogateOptions } from './replay-surrogate';
 export { detectArchitecture, applyArchitectureTags } from './architecture';
 export type { ArchitectureInfo } from './architecture';
+export type { HttpTrackingOptions } from './http-redact';
+export { HttpRequestModule } from './http-requests';
+export type { HttpRequestEvent } from './http-requests';
 
 type ErrorUtilsShape = {
   getGlobalHandler: () => (error: Error, isFatal?: boolean) => void;
@@ -186,7 +189,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
     } catch { /* not running under RN */ }
     AllStak.setIdentity({
       sdkName: 'allstak-react-native',
-      sdkVersion: '0.2.0',
+      sdkVersion: '0.3.0',
       platform: 'react-native',
       dist,
     });

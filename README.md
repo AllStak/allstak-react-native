@@ -45,18 +45,85 @@ npm install @allstak/react-native
 > Create a project at [app.allstak.sa](https://app.allstak.sa) to get your API key.
 
 ```ts
-import { installReactNative, AllStak } from '@allstak/react-native';
+import { Platform } from 'react-native';
+import { AllStak, installReactNative } from '@allstak/react-native';
 
-installReactNative({
+AllStak.init({
   apiKey: process.env.ALLSTAK_API_KEY!,
   environment: 'production',
-  release: 'mobile@1.0.0',
+  release: 'com.app@1.0.3+5',
+  dist: Platform.OS,            // 'ios' | 'android' — used as the dashboard filter for binary builds
+  enableHttpTracking: true,     // auto-instrument fetch + XHR + axios — see "HTTP tracking" below
 });
+installReactNative();           // ErrorUtils + Hermes promise rejections + Platform tags
 
 AllStak.captureException(new Error('test: hello from allstak-react-native'));
 ```
 
 Run the app — the test error appears in your dashboard within seconds.
+
+## HTTP tracking
+
+Setting `enableHttpTracking: true` (off by default) auto-wraps `fetch`,
+`XMLHttpRequest`, and `axios` (when the latter is installed) so every
+outbound HTTP call is recorded as an `http_request` event.
+
+**Privacy defaults are aggressive — `enableHttpTracking: true` is safe
+to ship to production:**
+
+- request bodies are **not** captured
+- response bodies are **not** captured
+- headers are **not** captured
+- `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`, `X-Auth-Token`,
+  `Proxy-Authorization` are **always** redacted
+- query params named `token`, `password`, `api_key`, `apikey`,
+  `authorization`, `auth`, `secret`, `access_token`, `refresh_token`,
+  `session`, `sessionid`, `jwt` are **always** redacted in the URL
+- own-ingest URLs (your AllStak host) are skipped to avoid recursion
+
+Enable richer capture only on routes you control:
+
+```ts
+AllStak.init({
+  apiKey: '...',
+  enableHttpTracking: true,
+  httpTracking: {
+    captureRequestBody: true,           // off by default
+    captureResponseBody: true,          // off by default
+    captureHeaders: true,               // off by default — auth headers still hard-redacted
+    redactHeaders: ['x-tenant'],        // additional names on top of the always-redact list
+    redactQueryParams: ['custom_id'],
+    ignoredUrls: [/health/i, '/metrics'],
+    allowedUrls: [],                    // if non-empty, ONLY these URLs are captured
+    maxBodyBytes: 4096,                 // bodies truncated past this with `…[truncated]`
+  },
+});
+```
+
+### axios
+
+If the project uses axios with a non-XHR adapter (rare on RN), explicitly
+instrument the instance — idempotent, so safe to call twice:
+
+```ts
+import axios from 'axios';
+const api = AllStak.instrumentAxios(axios.create({ baseURL: 'https://api.example.com' }));
+```
+
+### Errors auto-link to recent failed requests
+
+When `enableHttpTracking: true` is on, the most recent failed HTTP
+requests (status >= 400 or network error, last 10) are automatically
+attached to the next `captureException` under
+`metadata['http.recentFailed']`. Bodies are NOT included in this
+snapshot unless body capture is enabled — only `method`, `url`,
+`statusCode`, `durationMs`, `error`.
+
+### `dist`
+
+`dist: Platform.OS` is the recommended pattern — it labels every event
+with the binary build (`ios` / `android`) so the dashboard can filter
+to a single platform when triaging.
 
 ## Get Your API Key
 
