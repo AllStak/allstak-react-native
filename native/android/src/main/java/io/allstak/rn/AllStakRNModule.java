@@ -42,4 +42,21 @@ public class AllStakRNModule extends ReactContextBaseJavaModule {
             promise.reject("drain-failed", t);
         }
     }
+
+    /**
+     * DEV-ONLY: deliberately crash the app from a non-React thread so the
+     * Thread.UncaughtExceptionHandler in {@link AllStakCrashHandler} fires.
+     * Never call this from production code — it terminates the process.
+     * The JS wrapper {@code AllStak.__devCrashAndroid__} is documented as
+     * DEV_ONLY and is excluded from the public DX surface.
+     */
+    @ReactMethod
+    public void __devTriggerCrash(Promise promise) {
+        promise.resolve(true);
+        new Thread(() -> {
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            throw new RuntimeException(
+                "AllStakDevCrash: Dev-only deliberate native crash to verify capture");
+        }, "AllStakDevCrashThread").start();
+    }
 }

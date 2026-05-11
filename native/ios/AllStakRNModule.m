@@ -26,4 +26,20 @@ RCT_EXPORT_METHOD(drainPendingCrash:(RCTPromiseResolveBlock)resolve
     resolve(json ?: [NSNull null]);
 }
 
+// DEV-ONLY: deliberately crash the app to verify the crash-capture flow.
+// Throws an NSException synchronously on the next runloop tick. Never
+// expose this in user-facing UI of a production app — it kills the
+// process. The JS-side wrapper (`AllStak.__devCrashIos__`) is documented
+// as DEV_ONLY and is excluded from the public DX surface.
+RCT_EXPORT_METHOD(__devTriggerCrash:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @throw [NSException
+            exceptionWithName:@"AllStakDevCrash"
+            reason:@"Dev-only: deliberate native crash to verify capture"
+            userInfo:nil];
+    });
+    resolve(@YES);
+}
+
 @end

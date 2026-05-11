@@ -6,8 +6,21 @@
  * `document`, `localStorage`, `sessionStorage`, or browser DOM event
  * listeners.
  *
- * Usage:
+ * Recommended usage (one-liner):
  *
+ *   import { AllStakProvider } from '@allstak/react-native';
+ *
+ *   export default function App() {
+ *     return (
+ *       <AllStakProvider apiKey="YOUR_API_KEY" environment="production">
+ *         <AppRoot />
+ *       </AllStakProvider>
+ *     );
+ *   }
+ *
+ * Advanced / manual usage:
+ *
+ *   import { AllStak, installReactNative } from '@allstak/react-native';
  *   AllStak.init({ apiKey, environment, release });
  *   installReactNative();
  *
@@ -15,104 +28,55 @@
  * under the `native/` directory in this package. See README.
  */
 
-import { AllStak, __safeAddBreadcrumbForInstrumentation as safeBc } from './client';
-import { instrumentFetch, instrumentConsole } from './auto-breadcrumbs';
-import { applyArchitectureTags } from './architecture';
+import { AllStak } from './client';
 
-// React Native runs CommonJS, so `require` is always present at runtime.
-// Declared here (instead of pulling @types/node) so consumers don't inherit
-// Node types they don't need.
-declare const require: (id: string) => any;
+// ── Primary API: AllStakProvider (recommended) ──────────────────
+export { AllStakProvider, useAllStak, __resetProviderInstanceForTest } from './provider';
+export type { AllStakProviderProps } from './provider';
 
+// ── Core client + manual setup ──────────────────────────────────
 export { AllStak } from './client';
-export type { AllStakConfig, Breadcrumb } from './client';
+export type { AllStakConfig, Breadcrumb, ScreenshotArtifact, ScreenshotCaptureOptions } from './client';
+export type { TransportStats } from './transport';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
-export { instrumentReactNavigation, instrumentNavigationFromLinking } from './navigation';
+
+// ── React Native integrations (used internally by AllStakProvider) ──
+export { installReactNative } from './install';
+export type { ReactNativeInstallOptions } from './install';
+
+// ── Navigation helpers ──────────────────────────────────────────
+export {
+  instrumentReactNavigation,
+  instrumentNavigationFromLinking,
+  tryAutoInstrumentNavigation,
+  __resetAutoNavigationFlagForTest,
+} from './navigation';
+
+// ── Console capture types ───────────────────────────────────────
+export type { ConsoleCaptureOptions } from './auto-breadcrumbs';
+export { __resetConsoleInstrumentationFlagForTest } from './auto-breadcrumbs';
+
+// ── Advanced modules ────────────────────────────────────────────
 export { ReplaySurrogate } from './replay-surrogate';
 export type { ReplaySurrogateOptions } from './replay-surrogate';
 export { detectArchitecture, applyArchitectureTags } from './architecture';
 export type { ArchitectureInfo } from './architecture';
 export type { HttpTrackingOptions } from './http-redact';
+export {
+  ALWAYS_REDACT_HEADERS,
+  ALWAYS_REDACT_QUERY,
+  DEFAULT_REDACT_BODY_FIELDS,
+  REDACTED,
+  redactUrl,
+  sanitizeHeaders,
+  captureBodyResult,
+} from './http-redact';
 export { HttpRequestModule } from './http-requests';
 export type { HttpRequestEvent } from './http-requests';
 
-type ErrorUtilsShape = {
-  getGlobalHandler: () => (error: Error, isFatal?: boolean) => void;
-  setGlobalHandler: (handler: (error: Error, isFatal?: boolean) => void) => void;
-};
+// ── Native crash drain ──────────────────────────────────────────
 
-export interface ReactNativeInstallOptions {
-  /** Auto-capture unhandled JS exceptions via ErrorUtils. Default: true */
-  autoErrorHandler?: boolean;
-  /** Auto-capture unhandled promise rejections (Hermes). Default: true */
-  autoPromiseRejections?: boolean;
-  /** Auto-attach Platform.* info as tags. Default: true */
-  autoDeviceTags?: boolean;
-  /** Auto-emit breadcrumbs on AppState change. Default: true */
-  autoAppStateBreadcrumbs?: boolean;
-  /** Auto-instrument XHR (RN's fetch is XHR-based) for network breadcrumbs. Default: true */
-  autoNetworkCapture?: boolean;
-  /** Wrap `globalThis.fetch` to record HTTP breadcrumbs. Default: true */
-  autoFetchBreadcrumbs?: boolean;
-  /** Wrap `console.warn`/`console.error` to record log breadcrumbs. Default: true */
-  autoConsoleBreadcrumbs?: boolean;
-}
-
-/**
- * Patch the global `XMLHttpRequest` so any HTTP call (RN's `fetch` is
- * XHR-based) is captured as a network breadcrumb. Idempotent. Skips the
- * AllStak ingest host so we never recurse.
- */
-function instrumentXmlHttpRequest(): void {
-  const flag = '__allstak_xhr_patched__';
-  const X: any = (globalThis as any).XMLHttpRequest;
-  if (!X || X.prototype[flag]) return;
-
-  const ownHost = (() => {
-    try {
-      const cfg = AllStak.getConfig();
-      return (cfg?.host ?? 'https://api.allstak.sa').replace(/\/$/, '');
-    } catch { return ''; }
-  })();
-
-  const origOpen = X.prototype.open;
-  const origSend = X.prototype.send;
-
-  X.prototype.open = function (method: string, url: string, ...rest: unknown[]) {
-    (this as any).__allstak_method__ = method;
-    (this as any).__allstak_url__ = url;
-    return origOpen.call(this, method, url, ...rest);
-  };
-
-  X.prototype.send = function (body?: unknown) {
-    const start = Date.now();
-    const method: string = (this as any).__allstak_method__ || 'GET';
-    const url: string = (this as any).__allstak_url__ || '';
-    const isOwnIngest = ownHost && url.startsWith(ownHost);
-    let path = url;
-    try { path = new URL(url).pathname; } catch { /* relative URL */ }
-
-    const onDone = (status: number) => {
-      const durationMs = Date.now() - start;
-      try {
-        AllStak.addBreadcrumb('http', `${method} ${path} -> ${status}`,
-          status >= 400 ? 'error' : 'info',
-          { method, url: path, statusCode: status, durationMs });
-      } catch { /* never break */ }
-    };
-
-    if (!isOwnIngest) {
-      this.addEventListener?.('load', () => onDone(this.status || 0));
-      this.addEventListener?.('error', () => onDone(0));
-      this.addEventListener?.('abort', () => onDone(0));
-      this.addEventListener?.('timeout', () => onDone(0));
-    }
-
-    return origSend.call(this, body);
-  };
-
-  X.prototype[flag] = true;
-}
+declare const require: (id: string) => any;
 
 /**
  * Test seam — set a fake native module to be returned by
@@ -124,6 +88,32 @@ function instrumentXmlHttpRequest(): void {
 let __testNativeModule: any = null;
 export function __setNativeModuleForTest(mod: any): void {
   __testNativeModule = mod;
+}
+
+/**
+ * DEV-ONLY: deliberately trigger a native iOS or Android crash via the
+ * linked AllStak native module. This is intended for verifying the
+ * native-crash → drain → ingest pipeline during SDK development. It
+ * **terminates the app process** — never expose this in production UI.
+ *
+ *   import { __devTriggerNativeCrash } from '@allstak/react-native';
+ *   if (__DEV__) __devTriggerNativeCrash();  // app dies; relaunch drains
+ *
+ * No-op when the native module is not linked.
+ */
+export async function __devTriggerNativeCrash(): Promise<void> {
+  try {
+    let native: any = __testNativeModule;
+    if (!native) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const rn = require('react-native');
+      native = rn?.NativeModules?.AllStakNative;
+    }
+    if (!native || typeof native.__devTriggerCrash !== 'function') return;
+    await native.__devTriggerCrash();
+  } catch {
+    // Native module not present — silently no-op.
+  }
 }
 
 /**
@@ -162,128 +152,5 @@ export async function drainPendingNativeCrashes(release?: string): Promise<void>
     }
   } catch {
     // react-native not available in this runtime
-  }
-}
-
-export function installReactNative(options: ReactNativeInstallOptions = {}): void {
-  const autoError = options.autoErrorHandler !== false;
-  const autoPromise = options.autoPromiseRejections !== false;
-  const autoDevice = options.autoDeviceTags !== false;
-  const autoAppState = options.autoAppStateBreadcrumbs !== false;
-  const autoNetwork = options.autoNetworkCapture !== false;
-
-  AllStak.setTag('platform', 'react-native');
-  try { applyArchitectureTags((k, v) => AllStak.setTag(k, v)); } catch { /* ignore */ }
-
-  // Stamp SDK identity + auto-detected dist (ios-hermes / android-jsc / …).
-  try {
-    const hermes = typeof (globalThis as { HermesInternal?: unknown }).HermesInternal !== 'undefined';
-    let dist: string | undefined;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const rn = require('react-native');
-      const os = rn?.Platform?.OS as string | undefined;
-      if (os === 'ios' || os === 'android') {
-        dist = `${os}-${hermes ? 'hermes' : 'jsc'}`;
-      }
-    } catch { /* not running under RN */ }
-    AllStak.setIdentity({
-      sdkName: 'allstak-react-native',
-      sdkVersion: '0.3.0',
-      platform: 'react-native',
-      dist,
-    });
-  } catch { /* never break init */ }
-
-  if (autoNetwork) {
-    try { instrumentXmlHttpRequest(); } catch { /* not in JS env */ }
-  }
-
-  if (options.autoFetchBreadcrumbs !== false) {
-    try {
-      const cfg = AllStak.getConfig();
-      const ownBaseUrl = (cfg?.host ?? 'https://api.allstak.sa').replace(/\/$/, '');
-      instrumentFetch(safeBc, ownBaseUrl);
-    } catch { /* never break init */ }
-  }
-  if (options.autoConsoleBreadcrumbs !== false) {
-    try { instrumentConsole(safeBc); }
-    catch { /* never break init */ }
-  }
-
-  if (autoDevice) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const rn = require('react-native');
-      const Platform: any = rn?.Platform;
-      if (Platform) {
-        AllStak.setTag('device.os', String(Platform.OS ?? ''));
-        AllStak.setTag('device.osVersion', String(Platform.Version ?? ''));
-        if (Platform.constants?.Model) {
-          AllStak.setTag('device.model', String(Platform.constants.Model));
-        }
-      }
-    } catch { /* not running under RN */ }
-  }
-
-  if (autoAppState) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const rn = require('react-native');
-      const AppState: any = rn?.AppState;
-      if (AppState && typeof AppState.addEventListener === 'function') {
-        AppState.addEventListener('change', (next: string) => {
-          try {
-            AllStak.addBreadcrumb('navigation', `AppState → ${next}`, 'info', { appState: next });
-          } catch { /* ignore */ }
-        });
-      }
-    } catch { /* no RN available */ }
-  }
-
-  if (autoError) {
-    const eu: ErrorUtilsShape | undefined = (globalThis as any).ErrorUtils;
-    if (eu && typeof eu.setGlobalHandler === 'function') {
-      const prev = eu.getGlobalHandler();
-      eu.setGlobalHandler((error: Error, isFatal?: boolean) => {
-        try {
-          AllStak.captureException(error, {
-            source: 'react-native-ErrorUtils',
-            fatal: String(Boolean(isFatal)),
-          });
-        } catch { /* never break */ }
-        try { prev(error, isFatal); } catch { /* ignore */ }
-      });
-    }
-  }
-
-  if (autoPromise) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const tracking = require('promise/setimmediate/rejection-tracking');
-      tracking.enable({
-        allRejections: true,
-        onUnhandled: (_id: number, rejection: unknown) => {
-          const err = rejection instanceof Error
-            ? rejection
-            : new Error(`Unhandled promise rejection: ${String(rejection)}`);
-          try { AllStak.captureException(err, { source: 'unhandledRejection' }); }
-          catch { /* ignore */ }
-        },
-        onHandled: () => {},
-      });
-    } catch {
-      // Last-resort fallback: globalThis.addEventListener if present.
-      // Note: we explicitly do NOT touch window/document — only globalThis.
-      const g: any = globalThis as any;
-      if (typeof g.addEventListener === 'function') {
-        g.addEventListener('unhandledrejection', (ev: any) => {
-          const reason = ev?.reason;
-          const err = reason instanceof Error ? reason : new Error(String(reason));
-          try { AllStak.captureException(err, { source: 'unhandledRejection' }); }
-          catch { /* ignore */ }
-        });
-      }
-    }
   }
 }

@@ -7,18 +7,20 @@
  *   setUser / setTag / setIdentity / getSessionId
  */
 
-import { HttpTransport } from './transport';
+import { HttpTransport, TransportStats } from './transport';
 import { parseStack } from './stack';
+import { resolveDebugId } from './utils/debug-id';
 import { Scope, mergeScopes } from './scope';
 import { TracingModule, Span } from './tracing';
 import { ReplaySurrogate, ReplaySurrogateOptions } from './replay-surrogate';
 import { HttpRequestModule } from './http-requests';
 import type { HttpTrackingOptions } from './http-redact';
-import { installHttpInstrumentation } from './http-instrumentation';
+import { installHttpInstrumentation, unbindHttpInstrumentation } from './http-instrumentation';
+import type { ConsoleCaptureOptions } from './auto-breadcrumbs';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.3.0';
+export const SDK_VERSION = '0.3.1';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';
@@ -79,6 +81,12 @@ export interface AllStakConfig {
    * are ALWAYS redacted.
    */
   httpTracking?: HttpTrackingOptions;
+  /**
+   * Per-console-method capture flags. Defaults: warn + error captured,
+   * log + info NOT captured (to avoid breadcrumb spam from typical app
+   * logging). Set `{ log: true, info: true }` to opt-in.
+   */
+  captureConsole?: ConsoleCaptureOptions;
   maxBreadcrumbs?: number;
   /**
    * Probability in [0, 1] that any given error is sent. Default: 1 (no sampling).
@@ -93,6 +101,13 @@ export interface AllStakConfig {
   beforeSend?: (event: ErrorIngestPayload) =>
     | ErrorIngestPayload | null | undefined
     | Promise<ErrorIngestPayload | null | undefined>;
+  /**
+   * Optional fail-open screenshot capture. Off by default and provider-based
+   * so Expo/RN apps choose their own native or JS screenshot implementation.
+   * The SDK bounds timeout/size/sampling and drops screenshots before it can
+   * hurt app navigation, JS thread responsiveness, or telemetry delivery.
+   */
+  screenshot?: ScreenshotCaptureOptions;
   /** SDK identity overrides (set automatically by installReactNative). */
   sdkName?: string;
   sdkVersion?: string;
@@ -100,6 +115,27 @@ export interface AllStakConfig {
   dist?: string;
   commitSha?: string;
   branch?: string;
+}
+
+export interface ScreenshotArtifact {
+  data?: string;
+  contentType?: 'image/png' | 'image/jpeg' | 'image/webp';
+  width?: number;
+  height?: number;
+  sizeBytes?: number;
+  redacted?: boolean;
+  redactionStrategy?: string;
+}
+
+export interface ScreenshotCaptureOptions {
+  enabled?: boolean;
+  captureOnError?: boolean;
+  timeoutMs?: number;
+  maxBytes?: number;
+  sampleRate?: number;
+  provider?: (reason: { type: 'error'; error: Error; traceId?: string; requestId?: string }) =>
+    | ScreenshotArtifact | null | undefined
+    | Promise<ScreenshotArtifact | null | undefined>;
 }
 
 export interface Breadcrumb {
@@ -118,6 +154,7 @@ interface PayloadFrame {
   colno?: number;
   inApp?: boolean;
   platform?: string;
+  debugId?: string;
 }
 
 export interface ErrorIngestPayload {
@@ -133,10 +170,17 @@ export interface ErrorIngestPayload {
   environment?: string;
   release?: string;
   sessionId?: string;
+  traceId?: string;
+  spanId?: string;
+  parentSpanId?: string;
+  requestId?: string;
+  replayId?: string;
+  service?: string;
   user?: { id?: string; email?: string };
   metadata?: Record<string, unknown>;
   breadcrumbs?: Breadcrumb[];
   fingerprint?: string[];
+  debugMeta?: { images: Array<{ type: string; debugId: string }> };
 }
 
 function frameToString(f: PayloadFrame): string {
@@ -153,6 +197,19 @@ function generateId(): string {
   return `${seg(8)}-${seg(4)}-4${seg(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${seg(3)}-${seg(12)}`;
 }
 
+function stringContextValue(context: Record<string, unknown>, key: string): string | undefined {
+  const value = context[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function firstRecentRequestId(recentFailed: ReadonlyArray<{ requestId?: string }>): string | undefined {
+  for (let i = recentFailed.length - 1; i >= 0; i--) {
+    const requestId = recentFailed[i]?.requestId;
+    if (requestId && requestId.trim().length > 0) return requestId;
+  }
+  return undefined;
+}
+
 export class AllStakClient {
   private transport: HttpTransport;
   private config: AllStakConfig;
@@ -166,9 +223,6 @@ export class AllStakClient {
   private _instrumentAxios: ((axios: any) => any) | null = null;
 
   constructor(config: AllStakConfig) {
-    if (!config.apiKey) {
-      throw new Error('AllStak: config.apiKey is required');
-    }
     this.config = { ...config };
     if (!this.config.environment) this.config.environment = 'production';
     if (!this.config.sdkName) this.config.sdkName = SDK_NAME;
@@ -177,7 +231,7 @@ export class AllStakClient {
     this.sessionId = generateId();
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;
     const baseUrl = (config.host ?? INGEST_HOST).replace(/\/$/, '');
-    this.transport = new HttpTransport(baseUrl, config.apiKey);
+    this.transport = new HttpTransport(baseUrl, config.apiKey ?? '', Boolean(config.apiKey));
     this.tracing = new TracingModule(this.transport, {
       service: config.service ?? config.release ?? '',
       environment: this.config.environment ?? 'production',
@@ -202,6 +256,14 @@ export class AllStakClient {
         });
         const { instrumentAxios } = installHttpInstrumentation(
           this.httpRequests, config.httpTracking ?? {}, baseUrl,
+          {
+            tracing: this.tracing,
+            replay: this.replay,
+            release: this.config.release,
+            dist: this.config.dist,
+            platform: this.config.platform,
+            environment: this.config.environment,
+          },
         );
         this._instrumentAxios = instrumentAxios;
       } catch { /* never break init */ }
@@ -225,7 +287,17 @@ export class AllStakClient {
     const frames = parseStack(error.stack).map((f) => ({
       ...f,
       platform: this.config.platform,
+      debugId: resolveDebugId(f.filename),
     }));
+
+    // Aggregate unique debug-ids into debugMeta.images[] so the
+    // symbolicator can match by image-level debugId.
+    const debugIdSet = new Set<string>();
+    for (const f of frames) if (f.debugId) debugIdSet.add(f.debugId);
+    const debugMeta = debugIdSet.size > 0
+      ? { images: Array.from(debugIdSet).map((id) => ({ type: 'sourcemap' as const, debugId: id })) }
+      : undefined;
+
     const stackTrace = frames.length > 0 ? frames.map(frameToString) : undefined;
 
     const currentBreadcrumbs = this.breadcrumbs.length > 0 ? [...this.breadcrumbs] : undefined;
@@ -241,23 +313,51 @@ export class AllStakClient {
       'Error';
     const eff = this.effective();
     const traceContext: Record<string, unknown> = {};
-    const traceId = this.tracing.getTraceId();
-    if (traceId) traceContext.traceId = traceId;
-    const spanId = this.tracing.getCurrentSpanId();
-    if (spanId) traceContext.spanId = spanId;
     const recentFailed = this.httpRequests?.getRecentFailed() ?? [];
+    const linkedRequest = recentFailed.length > 0 ? recentFailed[recentFailed.length - 1] : undefined;
+    if (linkedRequest?.traceId) this.tracing.setTraceId(linkedRequest.traceId);
+    const exceptionSpan = linkedRequest ? this.tracing.startSpan('mobile.exception', {
+      description: error.message,
+      tags: {
+        requestId: linkedRequest.requestId,
+        exceptionClass,
+      },
+    }) : null;
+    exceptionSpan?.finish('error');
+    const traceId = linkedRequest?.traceId ?? this.tracing.getTraceId();
+    if (traceId) traceContext.traceId = traceId;
+    const spanId = exceptionSpan?.spanId || this.tracing.getCurrentSpanId();
+    if (spanId) traceContext.spanId = spanId;
     if (recentFailed.length > 0) {
       traceContext['http.recentFailed'] = recentFailed.map((r) => ({
         method: r.method, url: r.url, statusCode: r.statusCode,
         durationMs: r.durationMs, error: r.error,
+        requestId: r.requestId, traceId: r.traceId,
+        confidence: r.requestId === linkedRequest?.requestId ? 'inferred' : 'weak',
       }));
+      traceContext['http.linkConfidence'] = 'inferred';
     }
+    try {
+      if (!linkedRequest) throw new Error('no linked request');
+      this.replay?.recordTimelineMarker?.('exception', 'exception_captured', {
+        exceptionClass,
+        message: error.message,
+        requestLinkConfidence: linkedRequest ? 'inferred' : 'none',
+      }, {
+        traceId,
+        requestId: linkedRequest?.requestId,
+        spanId: spanId ?? undefined,
+        release: this.config.release,
+        dist: this.config.dist,
+      });
+    } catch { /* never break capture */ }
 
     const payload: ErrorIngestPayload = {
       exceptionClass,
       message: error.message,
       stackTrace,
       frames: frames.length > 0 ? frames : undefined,
+      debugMeta,
       platform: this.config.platform,
       sdkName: this.config.sdkName,
       sdkVersion: this.config.sdkVersion,
@@ -266,13 +366,32 @@ export class AllStakClient {
       environment: this.config.environment,
       release: this.config.release,
       sessionId: this.sessionId,
+      traceId: stringContextValue(traceContext, 'traceId'),
+      spanId: stringContextValue(traceContext, 'spanId'),
+      requestId: linkedRequest?.requestId ?? firstRecentRequestId(recentFailed),
+      service: this.config.service,
       user: eff.user,
       metadata: { ...this.buildMetadata(context), ...traceContext },
       breadcrumbs: currentBreadcrumbs,
       fingerprint: eff.fingerprint,
     };
 
-    this.sendThroughBeforeSend(payload);
+    if (this.shouldCaptureScreenshot()) {
+      void this.withScreenshotMetadata(error, payload)
+        .then((enriched) => this.sendThroughBeforeSend(enriched))
+        .catch(() => this.sendThroughBeforeSend({
+          ...payload,
+          metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'failed' },
+        }));
+      return;
+    }
+    this.sendThroughBeforeSend({
+      ...payload,
+      metadata: {
+        ...(payload.metadata ?? {}),
+        'screenshot.status': this.config.screenshot?.enabled ? 'unsupported' : 'disabled',
+      },
+    });
   }
 
   /** Start a new span. Auto-parented to any currently-active span. */
@@ -311,6 +430,9 @@ export class AllStakClient {
         environment: this.config.environment,
         release: this.config.release,
         sessionId: this.sessionId,
+        traceId: this.tracing.getTraceId(),
+        spanId: this.tracing.getCurrentSpanId() ?? undefined,
+        service: this.config.service,
         user: eff.user,
         metadata: this.buildMetadata(),
         fingerprint: eff.fingerprint,
@@ -410,10 +532,13 @@ export class AllStakClient {
 
   getConfig(): AllStakConfig { return this.config; }
 
+  getTransportStats(): TransportStats { return this.transport.getStats(); }
+
   destroy(): void {
     this.tracing.destroy();
     if (this.replay) { this.replay.destroy(); this.replay = null; }
     if (this.httpRequests) { this.httpRequests.destroy(); this.httpRequests = null; }
+    unbindHttpInstrumentation();
     this._instrumentAxios = null;
     this.breadcrumbs = [];
   }
@@ -433,6 +558,60 @@ export class AllStakClient {
       sdkVersion: this.config.sdkVersion,
       metadata: this.buildMetadata(),
     });
+  }
+
+  private shouldCaptureScreenshot(): boolean {
+    const screenshot = this.config.screenshot;
+    if (!screenshot?.enabled || screenshot.captureOnError === false || !screenshot.provider) return false;
+    const sampleRate = screenshot.sampleRate ?? 1;
+    return !(sampleRate <= 0 || (sampleRate < 1 && Math.random() >= sampleRate));
+  }
+
+  private async withScreenshotMetadata(error: Error, payload: ErrorIngestPayload): Promise<ErrorIngestPayload> {
+    const screenshot = this.config.screenshot;
+    if (!screenshot?.provider) {
+      return { ...payload, metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'unsupported' } };
+    }
+    const timeoutMs = Math.max(100, Math.min(screenshot.timeoutMs ?? 1500, 5000));
+    const maxBytes = Math.max(1024, screenshot.maxBytes ?? 200_000);
+    try {
+      const artifact = await Promise.race([
+        Promise.resolve(screenshot.provider({
+          type: 'error',
+          error,
+          traceId: payload.traceId,
+          requestId: payload.requestId,
+        })),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+      ]);
+      if (!artifact) {
+        return { ...payload, metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'timeout_or_empty' } };
+      }
+      const size = artifact.sizeBytes ?? byteSize(artifact.data);
+      if (size > maxBytes) {
+        this.transport.noteDropped();
+        return {
+          ...payload,
+          metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'dropped_too_large', 'screenshot.sizeBytes': size },
+        };
+      }
+      return {
+        ...payload,
+        metadata: {
+          ...(payload.metadata ?? {}),
+          'screenshot.status': 'captured',
+          'screenshot.contentType': artifact.contentType,
+          'screenshot.width': artifact.width,
+          'screenshot.height': artifact.height,
+          'screenshot.sizeBytes': size,
+          'screenshot.redacted': artifact.redacted ?? false,
+          'screenshot.redactionStrategy': artifact.redactionStrategy,
+          ...(artifact.data ? { 'screenshot.data': artifact.data } : {}),
+        },
+      };
+    } catch {
+      return { ...payload, metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'failed' } };
+    }
   }
 
   private passesSampleRate(): boolean {
@@ -529,9 +708,23 @@ export class AllStakClient {
 
 let instance: AllStakClient | null = null;
 
-function ensureInit(): AllStakClient {
-  if (!instance) throw new Error('AllStak.init() must be called before using the SDK');
+function maybeInit(): AllStakClient | null {
   return instance;
+}
+
+function noopSpan(operation = ''): Span {
+  return new Span('', '', '', operation, '', '', '', {}, () => undefined);
+}
+
+function emptyStats(): TransportStats {
+  return {
+    queued: 0,
+    sent: 0,
+    failed: 0,
+    dropped: 0,
+    consecutiveFailures: 0,
+    circuitOpenUntil: 0,
+  };
 }
 
 /**
@@ -551,35 +744,43 @@ export function __safeAddBreadcrumbForInstrumentation(
 
 export const AllStak = {
   init(config: AllStakConfig): AllStakClient {
-    if (instance) instance.destroy();
-    instance = new AllStakClient(config);
-    return instance;
+    try {
+      if (instance) instance.destroy();
+      instance = new AllStakClient(config);
+      return instance;
+    } catch {
+      instance = new AllStakClient({ ...config, apiKey: '' });
+      return instance;
+    }
   },
   captureException(error: Error, context?: Record<string, unknown>): void {
-    ensureInit().captureException(error, context);
+    try { maybeInit()?.captureException(error, context); } catch { /* fail-open */ }
   },
   captureMessage(
     message: string,
     level: 'fatal' | 'error' | 'warning' | 'info' = 'info',
     options?: { as?: 'log' | 'error' | 'both' },
   ): void {
-    ensureInit().captureMessage(message, level, options);
+    try { maybeInit()?.captureMessage(message, level, options); } catch { /* fail-open */ }
   },
   addBreadcrumb(type: string, message: string, level?: string, data?: Record<string, unknown>): void {
-    ensureInit().addBreadcrumb(type, message, level, data);
+    try { maybeInit()?.addBreadcrumb(type, message, level, data); } catch { /* fail-open */ }
   },
-  clearBreadcrumbs(): void { ensureInit().clearBreadcrumbs(); },
-  setUser(user: { id?: string; email?: string }): void { ensureInit().setUser(user); },
-  setTag(key: string, value: string): void { ensureInit().setTag(key, value); },
-  setTags(tags: Record<string, string>): void { ensureInit().setTags(tags); },
-  setExtra(key: string, value: unknown): void { ensureInit().setExtra(key, value); },
-  setExtras(extras: Record<string, unknown>): void { ensureInit().setExtras(extras); },
-  setContext(name: string, ctx: Record<string, unknown> | null): void { ensureInit().setContext(name, ctx); },
-  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void { ensureInit().setLevel(level); },
-  setFingerprint(fingerprint: string[] | null): void { ensureInit().setFingerprint(fingerprint); },
-  flush(timeoutMs?: number): Promise<boolean> { return ensureInit().flush(timeoutMs); },
+  clearBreadcrumbs(): void { try { maybeInit()?.clearBreadcrumbs(); } catch { /* fail-open */ } },
+  setUser(user: { id?: string; email?: string }): void { try { maybeInit()?.setUser(user); } catch { /* fail-open */ } },
+  setTag(key: string, value: string): void { try { maybeInit()?.setTag(key, value); } catch { /* fail-open */ } },
+  setTags(tags: Record<string, string>): void { try { maybeInit()?.setTags(tags); } catch { /* fail-open */ } },
+  setExtra(key: string, value: unknown): void { try { maybeInit()?.setExtra(key, value); } catch { /* fail-open */ } },
+  setExtras(extras: Record<string, unknown>): void { try { maybeInit()?.setExtras(extras); } catch { /* fail-open */ } },
+  setContext(name: string, ctx: Record<string, unknown> | null): void { try { maybeInit()?.setContext(name, ctx); } catch { /* fail-open */ } },
+  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void { try { maybeInit()?.setLevel(level); } catch { /* fail-open */ } },
+  setFingerprint(fingerprint: string[] | null): void { try { maybeInit()?.setFingerprint(fingerprint); } catch { /* fail-open */ } },
+  flush(timeoutMs?: number): Promise<boolean> {
+    try { return maybeInit()?.flush(timeoutMs) ?? Promise.resolve(true); }
+    catch { return Promise.resolve(false); }
+  },
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
-    ensureInit().setIdentity(identity);
+    try { maybeInit()?.setIdentity(identity); } catch { /* fail-open */ }
   },
   /**
    * Run `callback` with a fresh scoped context. Any user/tag/extra/context/
@@ -587,21 +788,51 @@ export const AllStak = {
    * callback (and any captures made within it). Pop is automatic, including
    * for async callbacks and thrown errors.
    */
-  withScope<T>(callback: (scope: Scope) => T): T { return ensureInit().withScope(callback); },
-  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
-    return ensureInit().startSpan(operation, options);
+  withScope<T>(callback: (scope: Scope) => T): T {
+    try {
+      const client = maybeInit();
+      return client ? client.withScope(callback) : callback(new Scope());
+    }
+    catch { return callback(new Scope()); }
   },
-  getTraceId(): string { return ensureInit().getTraceId(); },
-  setTraceId(traceId: string): void { ensureInit().setTraceId(traceId); },
-  getCurrentSpanId(): string | null { return ensureInit().getCurrentSpanId(); },
-  resetTrace(): void { ensureInit().resetTrace(); },
+  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
+    try { return maybeInit()?.startSpan(operation, options) ?? noopSpan(operation); }
+    catch { return noopSpan(operation); }
+  },
+  getTraceId(): string {
+    try { return maybeInit()?.getTraceId() ?? ''; } catch { return ''; }
+  },
+  setTraceId(traceId: string): void { try { maybeInit()?.setTraceId(traceId); } catch { /* fail-open */ } },
+  getCurrentSpanId(): string | null {
+    try { return maybeInit()?.getCurrentSpanId() ?? null; } catch { return null; }
+  },
+  resetTrace(): void { try { maybeInit()?.resetTrace(); } catch { /* fail-open */ } },
   /** Access the privacy-first replay surrogate (or null if disabled / sampled out). */
-  getReplay(): ReplaySurrogate | null { return ensureInit().getReplay(); },
+  getReplay(): ReplaySurrogate | null {
+    try { return maybeInit()?.getReplay() ?? null; } catch { return null; }
+  },
   /** Manually instrument an axios instance. No-op when HTTP tracking is off. */
-  instrumentAxios<T = any>(axios: T): T { return ensureInit().instrumentAxios(axios); },
-  getSessionId(): string { return ensureInit().getSessionId(); },
+  instrumentAxios<T = any>(axios: T): T {
+    try { return maybeInit()?.instrumentAxios(axios) ?? axios; } catch { return axios; }
+  },
+  getSessionId(): string {
+    try { return maybeInit()?.getSessionId() ?? ''; } catch { return ''; }
+  },
   getConfig(): AllStakConfig | null { return instance?.getConfig() ?? null; },
+  getTransportStats(): TransportStats {
+    try { return maybeInit()?.getTransportStats() ?? emptyStats(); } catch { return emptyStats(); }
+  },
   destroy(): void { instance?.destroy(); instance = null; },
   /** @internal — exposed for testing */
   _getInstance(): AllStakClient | null { return instance; },
 };
+
+function byteSize(value?: string): number {
+  if (!value) return 0;
+  try {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(value).length;
+  } catch {
+    /* ignore */
+  }
+  return value.length;
+}

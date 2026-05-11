@@ -24,6 +24,10 @@ const RECENT_FAILED_BUFFER_SIZE = 10;
 /** What instrumentation hands to the module per request. */
 export interface HttpRequestEvent {
   type: 'http_request';
+  traceId: string;
+  requestId: string;
+  spanId?: string;
+  parentSpanId?: string;
   method: string;
   url: string;        // already sanitized
   statusCode?: number;
@@ -35,12 +39,20 @@ export interface HttpRequestEvent {
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
   error?: string;
-  traceId?: string;
+  requestBodyStatus?: string;
+  responseBodyStatus?: string;
+  requestBodyRedactedFields?: string[];
+  responseBodyRedactedFields?: string[];
+  requestBodyTruncated?: boolean;
+  responseBodyTruncated?: boolean;
+  capturePolicy?: string;
+  linkConfidence?: 'exact' | 'inferred' | 'weak' | 'none';
 }
 
 export interface HttpRequestIngestItem {
   type: 'http_request';
   traceId: string;
+  requestId: string;
   direction: 'outbound';
   method: string;
   // Backend wants host + path separately; we also keep the full sanitized
@@ -57,6 +69,16 @@ export interface HttpRequestIngestItem {
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
   error?: string;
+  spanId?: string;
+  parentSpanId?: string;
+  requestBodyStatus?: string;
+  responseBodyStatus?: string;
+  requestBodyRedactedFields?: string[];
+  responseBodyRedactedFields?: string[];
+  requestBodyTruncated?: boolean;
+  responseBodyTruncated?: boolean;
+  capturePolicy?: string;
+  linkConfidence?: 'exact' | 'inferred' | 'weak' | 'none';
   environment?: string;
   release?: string;
   dist?: string;
@@ -83,6 +105,14 @@ function genTraceId(): string {
   const hex = (n: number) => Math.floor(Math.random() * n).toString(16).padStart(1, '0');
   const seg = (len: number) => Array.from({ length: len }, () => hex(16)).join('');
   return `${seg(8)}-${seg(4)}-4${seg(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${seg(3)}-${seg(12)}`;
+}
+
+function genRequestId(): string {
+  return genTraceId();
+}
+
+export function generateHttpId(): string {
+  return genTraceId();
 }
 
 function splitHostPath(url: string): { host: string; path: string } {
@@ -114,6 +144,7 @@ export class HttpRequestModule {
     const item: HttpRequestIngestItem = {
       type: 'http_request',
       traceId: ev.traceId ?? genTraceId(),
+      requestId: ev.requestId ?? genRequestId(),
       direction: 'outbound',
       method: (ev.method || 'GET').toUpperCase(),
       host,
@@ -128,6 +159,16 @@ export class HttpRequestModule {
       requestHeaders: ev.requestHeaders,
       responseHeaders: ev.responseHeaders,
       error: ev.error,
+      spanId: ev.spanId,
+      parentSpanId: ev.parentSpanId,
+      requestBodyStatus: ev.requestBodyStatus,
+      responseBodyStatus: ev.responseBodyStatus,
+      requestBodyRedactedFields: ev.requestBodyRedactedFields,
+      responseBodyRedactedFields: ev.responseBodyRedactedFields,
+      requestBodyTruncated: ev.requestBodyTruncated,
+      responseBodyTruncated: ev.responseBodyTruncated,
+      capturePolicy: ev.capturePolicy,
+      linkConfidence: ev.linkConfidence ?? 'exact',
       environment: this.defaults.environment,
       release: this.defaults.release,
       dist: this.defaults.dist,
@@ -145,7 +186,10 @@ export class HttpRequestModule {
     }
 
     if (this.queue.length >= BATCH_SIZE_THRESHOLD) { this.flush(); return; }
-    if (!this.flushTimer) this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+    if (!this.flushTimer) {
+      this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+      (this.flushTimer as any)?.unref?.();
+    }
   }
 
   /** Snapshot of the last failed requests for error-linking. Newest last. */

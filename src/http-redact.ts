@@ -43,6 +43,25 @@ export const ALWAYS_REDACT_QUERY = new Set([
 
 export const REDACTED = '[REDACTED]';
 
+export const DEFAULT_REDACT_BODY_FIELDS = [
+  'password',
+  'passcode',
+  'otp',
+  'token',
+  'authorization',
+  'cookie',
+  'session',
+  'refresh_token',
+  'access_token',
+  'jwt',
+  'card',
+  'credit_card',
+  'iban',
+  'national_id',
+  'secret',
+  'api_key',
+];
+
 export interface HttpTrackingOptions {
   /** Capture request body. Default false. Truncated to maxBodyBytes. */
   captureRequestBody?: boolean;
@@ -69,6 +88,18 @@ export interface HttpTrackingOptions {
   allowedUrls?: (string | RegExp)[];
   /** Max bytes per captured body. Default 4096. */
   maxBodyBytes?: number;
+  /** Content types eligible for body capture. Default JSON + text payloads. */
+  allowedContentTypes?: string[];
+  /** Additional JSON body fields to redact recursively. */
+  redactBodyFields?: string[];
+}
+
+export interface CapturedBody {
+  body?: string;
+  status: 'disabled' | 'captured' | 'redacted' | 'truncated' | 'unsupported' | 'empty';
+  redactedFields: string[];
+  truncated: boolean;
+  capturePolicy: string;
 }
 
 export function shouldCaptureUrl(url: string, opts: HttpTrackingOptions): boolean {
@@ -169,24 +200,142 @@ export function sanitizeHeaders(
  *   - '<binary>' when it's a Blob / FormData / ArrayBuffer / etc
  *   - truncated string with `…[truncated]` suffix when over maxBodyBytes
  */
-export function captureBody(
+export function captureBodyResult(
   body: unknown,
   enabled: boolean,
   maxBodyBytes: number,
-): string | undefined {
-  if (!enabled) return undefined;
-  if (body == null) return undefined;
+  opts: HttpTrackingOptions = {},
+  contentType?: string,
+): CapturedBody {
+  if (!enabled) {
+    return {
+      status: 'disabled',
+      redactedFields: [],
+      truncated: false,
+      capturePolicy: 'body_capture_disabled',
+    };
+  }
+  if (body == null) {
+    return {
+      status: 'empty',
+      redactedFields: [],
+      truncated: false,
+      capturePolicy: 'empty_body',
+    };
+  }
+  const allowed = opts.allowedContentTypes ?? ['application/json', 'text/', 'application/problem+json'];
+  if (contentType && !allowed.some((needle) => contentType.toLowerCase().includes(needle.toLowerCase()))) {
+    return {
+      status: 'unsupported',
+      redactedFields: [],
+      truncated: false,
+      capturePolicy: `unsupported_content_type:${contentType}`,
+    };
+  }
+
   let str: string;
+  let redactedFields: string[] = [];
   if (typeof body === 'string') str = body;
   else if (typeof body === 'number' || typeof body === 'boolean') str = String(body);
   else if (typeof body === 'object') {
     // Don't try to stringify Blob, FormData, ArrayBuffer, ReadableStream.
     const tag = Object.prototype.toString.call(body);
-    if (tag !== '[object Object]' && tag !== '[object Array]') return '<binary>';
-    try { str = JSON.stringify(body); } catch { return '<unserializable>'; }
+    if (tag !== '[object Object]' && tag !== '[object Array]') {
+      return {
+        body: '<binary>',
+        status: 'unsupported',
+        redactedFields: [],
+        truncated: false,
+        capturePolicy: 'unsupported_binary_body',
+      };
+    }
+    const redacted = redactJsonValue(body, opts);
+    redactedFields = redacted.redactedFields;
+    try { str = JSON.stringify(redacted.value); } catch {
+      return {
+        body: '<unserializable>',
+        status: 'unsupported',
+        redactedFields,
+        truncated: false,
+        capturePolicy: 'unserializable_body',
+      };
+    }
   } else {
-    return '<binary>';
+    return {
+      body: '<binary>',
+      status: 'unsupported',
+      redactedFields: [],
+      truncated: false,
+      capturePolicy: 'unsupported_body_type',
+    };
   }
-  if (str.length > maxBodyBytes) return str.slice(0, maxBodyBytes) + '…[truncated]';
-  return str;
+
+  if (typeof body === 'string' && looksJson(contentType, str)) {
+    try {
+      const redacted = redactJsonValue(JSON.parse(str), opts);
+      redactedFields = redacted.redactedFields;
+      str = JSON.stringify(redacted.value);
+    } catch {
+      str = redactSensitiveText(str, opts);
+    }
+  }
+
+  let truncated = false;
+  if (str.length > maxBodyBytes) {
+    str = str.slice(0, maxBodyBytes) + '…[truncated]';
+    truncated = true;
+  }
+  return {
+    body: str,
+    status: truncated ? 'truncated' : redactedFields.length > 0 ? 'redacted' : 'captured',
+    redactedFields: Array.from(new Set(redactedFields)).sort(),
+    truncated,
+    capturePolicy: 'opt_in_body_capture',
+  };
+}
+
+export function captureBody(
+  body: unknown,
+  enabled: boolean,
+  maxBodyBytes: number,
+): string | undefined {
+  return captureBodyResult(body, enabled, maxBodyBytes).body;
+}
+
+function looksJson(contentType: string | undefined, body: string): boolean {
+  if (contentType && contentType.toLowerCase().includes('json')) return true;
+  const trimmed = body.trim();
+  return (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
+}
+
+function redactJsonValue(value: unknown, opts: HttpTrackingOptions, path = ''): { value: unknown; redactedFields: string[] } {
+  const fieldSet = new Set([...DEFAULT_REDACT_BODY_FIELDS, ...(opts.redactBodyFields ?? [])].map((v) => v.toLowerCase()));
+  const redactedFields: string[] = [];
+  const walk = (input: unknown, currentPath: string): unknown => {
+    if (Array.isArray(input)) return input.map((item, index) => walk(item, `${currentPath}[${index}]`));
+    if (!input || typeof input !== 'object') return input;
+    const out: Record<string, unknown> = {};
+    for (const [key, raw] of Object.entries(input as Record<string, unknown>)) {
+      const keyLower = key.toLowerCase();
+      const nextPath = currentPath ? `${currentPath}.${key}` : key;
+      if (fieldSet.has(keyLower) || keyLower.includes('token') || keyLower.includes('password')) {
+        out[key] = REDACTED;
+        redactedFields.push(nextPath);
+      } else {
+        out[key] = walk(raw, nextPath);
+      }
+    }
+    return out;
+  };
+  return { value: walk(value, path), redactedFields };
+}
+
+function redactSensitiveText(input: string, opts: HttpTrackingOptions): string {
+  const fields = [...DEFAULT_REDACT_BODY_FIELDS, ...(opts.redactBodyFields ?? [])];
+  let out = input;
+  for (const key of fields) {
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`("${escaped}"\\s*:\\s*)"[^"]*"`, 'gi'), `$1"${REDACTED}"`);
+  }
+  return out;
 }

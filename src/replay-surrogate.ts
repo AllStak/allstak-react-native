@@ -41,8 +41,19 @@ export interface ReplaySurrogateOptions {
 
 interface SurrogateEvent {
   ts: number;
-  k: 'screen' | 'appstate' | 'manual';
+  k: 'screen' | 'appstate' | 'manual' | 'request' | 'exception' | 'response' | 'action' | 'retry';
   data: Record<string, unknown>;
+}
+
+export interface TimelineContext {
+  traceId?: string;
+  requestId?: string;
+  spanId?: string;
+  eventId?: string;
+  release?: string;
+  dist?: string;
+  screen?: string;
+  route?: string;
 }
 
 export class ReplaySurrogate {
@@ -74,11 +85,12 @@ export class ReplaySurrogate {
     if (Math.random() >= this.opts.sampleRate) return false;
     this.active = true;
     this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+    (this.flushTimer as any)?.unref?.();
     return true;
   }
 
   /** Record a screen view. Filters params through the safeParams allow-list. */
-  recordScreenView(routeName: string, params?: Record<string, unknown>): void {
+  recordScreenView(routeName: string, params?: Record<string, unknown>, context?: TimelineContext): void {
     if (!this.active) return;
     const safe: Record<string, unknown> = {};
     if (params && this.opts.safeParams.length > 0) {
@@ -86,19 +98,30 @@ export class ReplaySurrogate {
         if (key in params) safe[key] = params[key];
       }
     }
-    this.push({ ts: Date.now(), k: 'screen', data: { route: routeName, params: safe } });
+    this.push({ ts: Date.now(), k: 'screen', data: { route: routeName, params: safe, ...compact(context) } });
   }
 
   /** Record an AppState transition (foreground/background/inactive). */
-  recordAppState(next: string): void {
+  recordAppState(next: string, context?: TimelineContext): void {
     if (!this.active) return;
-    this.push({ ts: Date.now(), k: 'appstate', data: { state: next } });
+    this.push({ ts: Date.now(), k: 'appstate', data: { state: next, ...compact(context) } });
   }
 
   /** Record a free-form, customer-validated checkpoint. */
-  recordManual(label: string, data?: Record<string, unknown>): void {
+  recordManual(label: string, data?: Record<string, unknown>, context?: TimelineContext): void {
     if (!this.active) return;
-    this.push({ ts: Date.now(), k: 'manual', data: { label, ...(data ?? {}) } });
+    this.push({ ts: Date.now(), k: 'manual', data: { label, ...(data ?? {}), ...compact(context) } });
+  }
+
+  /** Record a forensic mobile session timeline marker. This is not replay. */
+  recordTimelineMarker(
+    kind: SurrogateEvent['k'],
+    label: string,
+    data?: Record<string, unknown>,
+    context?: TimelineContext,
+  ): void {
+    if (!this.active) return;
+    this.push({ ts: Date.now(), k: kind, data: { label, ...(data ?? {}), ...compact(context) } });
   }
 
   destroy(): void {
@@ -128,4 +151,13 @@ export class ReplaySurrogate {
       events,
     });
   }
+}
+
+function compact(context?: TimelineContext): Record<string, unknown> {
+  if (!context) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (value !== undefined && value !== null && value !== '') out[key] = value;
+  }
+  return out;
 }
