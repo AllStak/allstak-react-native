@@ -33,7 +33,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AllStak/allstak-react-native.git"
+    "url": "git+https://github.com/AllStak/allstak-react-native.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
