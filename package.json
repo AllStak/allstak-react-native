@@ -23,11 +23,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/allstak-io/allstak-react-native.git"
+    "url": "https://github.com/AllStak/allstak-react-native.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
-    "url": "https://github.com/allstak-io/allstak-react-native/issues"
+    "url": "https://github.com/AllStak/allstak-react-native/issues"
   },
   "keywords": [
     "allstak",
