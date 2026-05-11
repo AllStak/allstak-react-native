@@ -5,7 +5,7 @@ AllStak's React Native SDK captures JS errors, render errors, unhandled promises
 Use one wrapper, keep privacy-first defaults, support Hermes, and upload React Native source maps through build hooks instead of manual release chores.
 
 [![npm version](https://img.shields.io/npm/v/@allstak/react-native.svg)](https://www.npmjs.com/package/@allstak/react-native)
-[![CI](https://github.com/allstak-io/allstak-react-native/actions/workflows/ci.yml/badge.svg)](https://github.com/allstak-io/allstak-react-native/actions)
+[![CI](https://github.com/AllStak/allstak-react-native/actions/workflows/ci.yml/badge.svg)](https://github.com/AllStak/allstak-react-native/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## 1. Overview
@@ -452,7 +452,7 @@ Current status from those reports:
 
 - Dashboard: https://app.allstak.sa
 - Documentation: https://docs.allstak.sa
-- Source: https://github.com/allstak-io/allstak-react-native
+- Source: https://github.com/AllStak/allstak-react-native
 
 ## License
 
