@@ -19,13 +19,15 @@
  *     proceed — never break consumer networking
  */
 
-import { HttpRequestModule, HttpRequestEvent } from './http-requests';
+import { HttpRequestModule, HttpRequestEvent, generateHttpId } from './http-requests';
+import type { TracingModule, Span } from './tracing';
+import type { ReplaySurrogate } from './replay-surrogate';
 import {
   HttpTrackingOptions,
   redactUrl,
   sanitizeHeaders,
   shouldCaptureUrl,
-  captureBody,
+  captureBodyResult,
 } from './http-redact';
 
 const FETCH_FLAG = '__allstak_http_fetch_patched__';
@@ -39,8 +41,10 @@ const DEFAULT_MAX_BODY = 4096;
 // global, and a destroyed module silently no-ops instead of throwing.
 let _currentModule: HttpRequestModule | null = null;
 let _currentOpts: BoundOptions | null = null;
+let _currentRuntime: RuntimeBinding | null = null;
 function currentModule(): HttpRequestModule | null { return _currentModule; }
 function currentOpts(): BoundOptions | null { return _currentOpts; }
+function currentRuntime(): RuntimeBinding | null { return _currentRuntime; }
 function safeCapture(ev: HttpRequestEvent): void {
   try { currentModule()?.capture(ev); } catch { /* never break host */ }
 }
@@ -53,6 +57,24 @@ interface BoundOptions extends Required<Omit<HttpTrackingOptions, 'redactHeaders
   ownIngestPrefix: string;
 }
 
+interface RuntimeBinding {
+  tracing: TracingModule;
+  replay: ReplaySurrogate | null;
+  release?: string;
+  dist?: string;
+  platform?: string;
+  environment?: string;
+}
+
+interface RequestContext {
+  traceId: string;
+  requestId: string;
+  spanId: string;
+  parentSpanId: string;
+  traceparent: string;
+  span: Span;
+}
+
 function bind(opts: HttpTrackingOptions, ownIngestHost: string): BoundOptions {
   return {
     captureRequestBody: opts.captureRequestBody ?? false,
@@ -63,6 +85,8 @@ function bind(opts: HttpTrackingOptions, ownIngestHost: string): BoundOptions {
     ignoredUrls: opts.ignoredUrls ?? [],
     allowedUrls: opts.allowedUrls ?? [],
     maxBodyBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY,
+    allowedContentTypes: opts.allowedContentTypes ?? ['application/json', 'text/', 'application/problem+json'],
+    redactBodyFields: opts.redactBodyFields ?? [],
     ownIngestPrefix: ownIngestHost.replace(/\/$/, ''),
   };
 }
@@ -115,6 +139,83 @@ function headersToObject(h: any): Record<string, string> {
   return {};
 }
 
+function normalizeTraceId(traceId: string): string {
+  const hex = traceId.replace(/[^a-fA-F0-9]/g, '').toLowerCase();
+  return (hex + '00000000000000000000000000000000').slice(0, 32);
+}
+
+function normalizeSpanId(spanId: string): string {
+  const hex = spanId.replace(/[^a-fA-F0-9]/g, '').toLowerCase();
+  return (hex + '0000000000000000').slice(0, 16);
+}
+
+function createRequestContext(method: string, url: string): RequestContext | null {
+  const runtime = currentRuntime();
+  if (!runtime) return null;
+  const requestId = generateHttpId();
+  const parentSpanId = runtime.tracing.getCurrentSpanId() ?? '';
+  const span = runtime.tracing.startSpan('mobile.http', {
+    description: `${method.toUpperCase()} ${url}`,
+    tags: { requestId, method: method.toUpperCase(), platform: runtime.platform ?? 'react-native' },
+  });
+  const traceId = runtime.tracing.getTraceId();
+  const spanId = span.spanId;
+  return {
+    traceId,
+    requestId,
+    spanId,
+    parentSpanId,
+    traceparent: `00-${normalizeTraceId(traceId)}-${normalizeSpanId(spanId)}-01`,
+    span,
+  };
+}
+
+function propagationHeaders(ctx: RequestContext): Record<string, string> {
+  const headers: Record<string, string> = {
+    traceparent: ctx.traceparent,
+    'x-allstak-trace-id': ctx.traceId,
+    'x-allstak-request-id': ctx.requestId,
+  };
+  if (ctx.parentSpanId) headers['x-allstak-parent-span-id'] = ctx.parentSpanId;
+  return headers;
+}
+
+function mergeHeaders(headers: any, propagation: Record<string, string>): any {
+  const entries = Object.entries(propagation);
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+    const next = new Headers(headers);
+    for (const [k, v] of entries) if (!next.has(k)) next.set(k, v);
+    return next;
+  }
+  if (Array.isArray(headers)) {
+    const existing = new Set(headers.map(([k]) => String(k).toLowerCase()));
+    const next = [...headers];
+    for (const [k, v] of entries) if (!existing.has(k.toLowerCase())) next.push([k, v]);
+    return next;
+  }
+  const next: Record<string, string> = { ...(headers ?? {}) };
+  const lower = new Set(Object.keys(next).map((k) => k.toLowerCase()));
+  for (const [k, v] of entries) if (!lower.has(k.toLowerCase())) next[k] = v;
+  return next;
+}
+
+function injectFetchHeaders(input: any, init: any, ctx: RequestContext): { input: any; init: any } {
+  const headers = mergeHeaders(init?.headers ?? (input && typeof input === 'object' ? input.headers : undefined), propagationHeaders(ctx));
+  return { input, init: { ...(init ?? {}), headers } };
+}
+
+function recordTimeline(kind: 'request' | 'exception' | 'response' | 'retry', label: string, ctx: RequestContext, data?: Record<string, unknown>): void {
+  try {
+    currentRuntime()?.replay?.recordTimelineMarker?.(kind, label, data, {
+      traceId: ctx.traceId,
+      requestId: ctx.requestId,
+      spanId: ctx.spanId,
+      release: currentRuntime()?.release,
+      dist: currentRuntime()?.dist,
+    });
+  } catch { /* never break host */ }
+}
+
 // ───────────────────────────────────────────────────────────────
 // fetch
 // ───────────────────────────────────────────────────────────────
@@ -141,20 +242,34 @@ export function patchFetch(): void {
     }
 
     const start = Date.now();
-    const reqHeaders = sanitizeHeaders(headersToObject(init?.headers ?? (input && input.headers)), opts);
-    const reqBody = captureBody(init?.body, opts.captureRequestBody, opts.maxBodyBytes);
+    const ctx = createRequestContext(method, sanitizedUrl);
+    const requestInit = ctx ? injectFetchHeaders(input, init, ctx).init : init;
+    if (ctx) recordTimeline('request', 'request_started', ctx, { method, url: sanitizedUrl });
+    const reqHeaders = sanitizeHeaders(headersToObject(requestInit?.headers ?? (input && input.headers)), opts);
+    const reqBody = captureBodyResult(requestInit?.body, opts.captureRequestBody, opts.maxBodyBytes, opts, reqHeaders?.['content-type']);
     const reqSize = safeByteLength(typeof init?.body === 'string' ? init.body : undefined);
 
     let response: any;
     try {
-      response = await original.call(this, input, init);
+      response = await original.call(this, input, requestInit);
     } catch (err) {
+      ctx?.span.finish('error');
+      if (ctx) recordTimeline('exception', 'request_failed', ctx, { method, url: sanitizedUrl, error: String((err as any)?.message ?? err) });
       safeCapture({
         type: 'http_request',
+        traceId: ctx?.traceId ?? generateHttpId(),
+        requestId: ctx?.requestId ?? generateHttpId(),
+        spanId: ctx?.spanId,
+        parentSpanId: ctx?.parentSpanId,
         method, url: sanitizedUrl, statusCode: 0,
         durationMs: Date.now() - start,
-        requestBody: reqBody, requestHeaders: reqHeaders, requestSize: reqSize,
+        requestBody: reqBody.body, requestHeaders: reqHeaders, requestSize: reqSize,
+        requestBodyStatus: reqBody.status,
+        requestBodyRedactedFields: reqBody.redactedFields,
+        requestBodyTruncated: reqBody.truncated,
+        capturePolicy: reqBody.capturePolicy,
         error: String((err as any)?.message ?? err),
+        linkConfidence: 'exact',
       });
       throw err;
     }
@@ -172,18 +287,34 @@ export function patchFetch(): void {
         try {
           const cloned = response.clone();
           const text = await cloned.text();
-          respBody = captureBody(text, true, opts.maxBodyBytes);
+          respBody = captureBodyResult(text, true, opts.maxBodyBytes, opts, respHeaders?.['content-type']).body;
           if (respSize == null) respSize = safeByteLength(text);
         } catch { /* clone unsafe — leave body undefined */ }
       }
     } catch { /* never break the response surface */ }
+    const respBodyResult = captureBodyResult(respBody, opts.captureResponseBody && respBody !== undefined, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
+    const isError = response.status >= 400;
+    ctx?.span.setTag('requestId', ctx.requestId).setTag('http.status_code', String(response.status)).finish(isError ? 'error' : 'ok');
+    if (ctx) recordTimeline(isError ? 'exception' : 'response', isError ? 'request_failed' : 'response_received', ctx, { statusCode: response.status, durationMs });
 
     safeCapture({
       type: 'http_request',
+      traceId: ctx?.traceId ?? generateHttpId(),
+      requestId: ctx?.requestId ?? generateHttpId(),
+      spanId: ctx?.spanId,
+      parentSpanId: ctx?.parentSpanId,
       method, url: sanitizedUrl,
       statusCode: response.status, durationMs,
-      requestBody: reqBody, requestHeaders: reqHeaders, requestSize: reqSize,
-      responseBody: respBody, responseHeaders: respHeaders, responseSize: respSize,
+      requestBody: reqBody.body, requestHeaders: reqHeaders, requestSize: reqSize,
+      responseBody: respBodyResult.body, responseHeaders: respHeaders, responseSize: respSize,
+      requestBodyStatus: reqBody.status,
+      responseBodyStatus: respBodyResult.status,
+      requestBodyRedactedFields: reqBody.redactedFields,
+      responseBodyRedactedFields: respBodyResult.redactedFields,
+      requestBodyTruncated: reqBody.truncated,
+      responseBodyTruncated: respBodyResult.truncated,
+      capturePolicy: `${reqBody.capturePolicy};${respBodyResult.capturePolicy}`,
+      linkConfidence: 'exact',
     });
 
     return response;
@@ -232,7 +363,14 @@ export function patchXhr(): void {
     }
 
     const reqHeaders = sanitizeHeaders((this as any).__allstak_headers__, opts);
-    const reqBody = captureBody(body, opts.captureRequestBody, opts.maxBodyBytes);
+    const ctx = createRequestContext(method, sanitizedUrl);
+    if (ctx) {
+      for (const [k, v] of Object.entries(propagationHeaders(ctx))) {
+        try { origSetRequestHeader.call(this, k, v); } catch { /* ignore */ }
+      }
+      recordTimeline('request', 'request_started', ctx, { method, url: sanitizedUrl });
+    }
+    const reqBody = captureBodyResult(body, opts.captureRequestBody, opts.maxBodyBytes, opts, reqHeaders?.['content-type']);
     const reqSize = safeByteLength(typeof body === 'string' ? body : undefined);
 
     const finish = (statusCode: number, error?: string) => {
@@ -251,22 +389,37 @@ export function patchXhr(): void {
           }
           respHeaders = sanitizeHeaders(dict, liveOpts);
         }
+        let respBodyResult = captureBodyResult(undefined, false, liveOpts.maxBodyBytes, liveOpts);
         if (liveOpts.captureResponseBody) {
           const text = (this as any).responseText;
           if (typeof text === 'string') {
-            respBody = captureBody(text, true, liveOpts.maxBodyBytes);
+            respBodyResult = captureBodyResult(text, true, liveOpts.maxBodyBytes, liveOpts, respHeaders?.['content-type']);
+            respBody = respBodyResult.body;
             respSize = safeByteLength(text);
           }
         }
       } catch { /* never break */ }
+      const failed = !!error || statusCode >= 400;
+      ctx?.span.setTag('requestId', ctx.requestId).setTag('http.status_code', String(statusCode)).finish(failed ? 'error' : 'ok');
+      if (ctx) recordTimeline(failed ? 'exception' : 'response', failed ? 'request_failed' : 'response_received', ctx, { statusCode, durationMs, error });
 
       safeCapture({
         type: 'http_request',
+        traceId: ctx?.traceId ?? generateHttpId(),
+        requestId: ctx?.requestId ?? generateHttpId(),
+        spanId: ctx?.spanId,
+        parentSpanId: ctx?.parentSpanId,
         method, url: sanitizedUrl,
         statusCode, durationMs,
-        requestBody: reqBody, requestHeaders: reqHeaders, requestSize: reqSize,
+        requestBody: reqBody.body, requestHeaders: reqHeaders, requestSize: reqSize,
         responseBody: respBody, responseHeaders: respHeaders, responseSize: respSize,
+        requestBodyStatus: reqBody.status,
+        responseBodyStatus: respBody ? 'captured' : opts.captureResponseBody ? 'empty' : 'disabled',
+        requestBodyRedactedFields: reqBody.redactedFields,
+        requestBodyTruncated: reqBody.truncated,
+        capturePolicy: reqBody.capturePolicy,
         error,
+        linkConfidence: 'exact',
       });
     };
 
@@ -305,15 +458,22 @@ export function instrumentAxiosInstance(
   if (axiosInstance[AXIOS_FLAG]) return axiosInstance;
   axiosInstance[AXIOS_FLAG] = true;
 
-  const reqStarts = new WeakMap<object, { start: number; method: string; rawUrl: string }>();
+  const reqStarts = new WeakMap<object, { start: number; method: string; rawUrl: string; ctx: RequestContext | null }>();
 
   axiosInstance.interceptors.request.use((config: any) => {
     try {
       const rawUrl = (config.baseURL ? config.baseURL.replace(/\/$/, '') : '') + (config.url || '');
+      const method = String(config.method || 'GET').toUpperCase();
+      const ctx = createRequestContext(method, rawUrl);
+      if (ctx) {
+        config.headers = mergeHeaders(config.headers, propagationHeaders(ctx));
+        recordTimeline('request', 'request_started', ctx, { method, url: rawUrl });
+      }
       reqStarts.set(config, {
         start: Date.now(),
-        method: String(config.method || 'GET').toUpperCase(),
+        method,
         rawUrl,
+        ctx,
       });
     } catch { /* ignore */ }
     return config;
@@ -328,22 +488,37 @@ export function instrumentAxiosInstance(
 
     const sanitizedUrl = redactUrl(meta.rawUrl, opts);
     const reqHeaders = sanitizeHeaders(headersToObject(cfg.headers), opts);
-    const reqBody = captureBody(cfg.data, opts.captureRequestBody, opts.maxBodyBytes);
+    const reqBody = captureBodyResult(cfg.data, opts.captureRequestBody, opts.maxBodyBytes, opts, reqHeaders?.['content-type']);
     const respHeaders = sanitizeHeaders(headersToObject(response?.headers), opts);
-    const respBody = captureBody(response?.data, opts.captureResponseBody, opts.maxBodyBytes);
+    const respBody = captureBodyResult(response?.data, opts.captureResponseBody, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
+    const failed = !!error || statusCode >= 400;
+    meta.ctx?.span.setTag('requestId', meta.ctx.requestId).setTag('http.status_code', String(statusCode)).finish(failed ? 'error' : 'ok');
+    if (meta.ctx) recordTimeline(failed ? 'exception' : 'response', failed ? 'request_failed' : 'response_received', meta.ctx, { statusCode, error });
 
     try {
       module.capture({
         type: 'http_request',
+        traceId: meta.ctx?.traceId ?? generateHttpId(),
+        requestId: meta.ctx?.requestId ?? generateHttpId(),
+        spanId: meta.ctx?.spanId,
+        parentSpanId: meta.ctx?.parentSpanId,
         method: meta.method,
         url: sanitizedUrl,
         statusCode,
         durationMs: Date.now() - meta.start,
-        requestBody: reqBody,
+        requestBody: reqBody.body,
         requestHeaders: reqHeaders,
-        responseBody: respBody,
+        responseBody: respBody.body,
         responseHeaders: respHeaders,
+        requestBodyStatus: reqBody.status,
+        responseBodyStatus: respBody.status,
+        requestBodyRedactedFields: reqBody.redactedFields,
+        responseBodyRedactedFields: respBody.redactedFields,
+        requestBodyTruncated: reqBody.truncated,
+        responseBodyTruncated: respBody.truncated,
+        capturePolicy: `${reqBody.capturePolicy};${respBody.capturePolicy}`,
         error,
+        linkConfidence: 'exact',
       });
     } catch { /* ignore */ }
   };
@@ -382,12 +557,14 @@ export function installHttpInstrumentation(
   module: HttpRequestModule,
   options: HttpTrackingOptions,
   ownIngestHost: string,
+  runtime: RuntimeBinding,
 ): { instrumentAxios: (axios: any) => any } {
   const bound = bind(options, ownIngestHost);
   // Bind first so already-installed wrappers immediately route to the new
   // module/options. Subsequent patch* calls are idempotent no-ops.
   _currentModule = module;
   _currentOpts = bound;
+  _currentRuntime = runtime;
   try { patchFetch(); } catch { /* ignore */ }
   try { patchXhr(); } catch { /* ignore */ }
   try { tryAutoInstrumentAxios(module, bound); } catch { /* ignore */ }
@@ -400,6 +577,7 @@ export function installHttpInstrumentation(
 export function unbindHttpInstrumentation(): void {
   _currentModule = null;
   _currentOpts = null;
+  _currentRuntime = null;
 }
 
 /** @internal — for tests. */

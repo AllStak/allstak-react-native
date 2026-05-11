@@ -28,8 +28,13 @@ Object.defineProperty(globalThis, 'fetch', {
 
 const { AllStak } = await import('../dist/index.mjs');
 
-test('init throws when apiKey missing', () => {
-  assert.throws(() => AllStak.init({}), /apiKey is required/);
+test('init without apiKey fails open and disables transport', async () => {
+  sent.length = 0;
+  assert.doesNotThrow(() => AllStak.init({}));
+  assert.doesNotThrow(() => AllStak.captureException(new Error('no-key')));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 0);
+  assert.ok(AllStak.getTransportStats().dropped >= 1);
 });
 
 test('init + captureException posts to /ingest/v1/errors with X-AllStak-Key', async () => {
@@ -95,4 +100,3 @@ test('source code contains no banned browser APIs', async () => {
     assert.ok(!re.test(src), `dist must not reference ${re}`);
   }
 });
-

@@ -50,7 +50,7 @@ test('plugin stamps extra._allstak with release/environment/dist/pluginVersion',
     release: 'mobile@2.0.0',
     environment: 'production',
     dist: 'ios-hermes',
-    pluginVersion: '0.3.0',
+    pluginVersion: '0.3.1',
   });
 });
 

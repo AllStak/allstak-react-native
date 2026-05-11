@@ -1,0 +1,132 @@
+// AllStak source-map upload — Gradle helper.
+//
+// Drop this file into your Android project at:
+//   allstak-react-native/build-hooks/allstak-sourcemaps.gradle
+// (or any path you like — just point apply-from at it)
+//
+// Then add ONE line to android/app/build.gradle, after the
+// react-native-gradle-plugin apply at the top:
+//
+//   apply from: file('../node_modules/@allstak/react-native/build-hooks/allstak-sourcemaps.gradle')
+//
+// Set these in ~/.gradle/gradle.properties or as `-PallstakRelease=…`
+// on the command line:
+//
+//   allstakRelease=mobile@1.2.3+5
+//   allstakUploadToken=aspk_...        # only required for actual upload
+//   allstakHost=https://api.allstak.sa # optional override
+//
+// What it does:
+//   • Hooks every variant whose name ends with "Release" (e.g.
+//     bundleRelease, assembleRelease) and runs the AllStak uploader
+//     on the Metro bundle + sourcemap that variant produced.
+//   • Falls back to inject-only mode when no upload token is set.
+//   • Never fails the build over a sourcemap glitch — logs and moves on.
+//
+// Output path conventions (Metro/Hermes default):
+//   build/generated/assets/createBundleReleaseJsAndAssets/index.android.bundle
+//   build/generated/sourcemaps/react/release/index.android.bundle.map
+
+import org.gradle.api.tasks.Exec
+import java.nio.file.Files
+import java.nio.file.Paths
+
+afterEvaluate {
+    android.applicationVariants.all { variant ->
+        def variantName = variant.name
+        if (!variantName.toLowerCase().endsWith('release')) return
+
+        def capitalized = variantName.capitalize()
+        // The bundle/sourcemap-emitting tasks are created by the React
+        // Native gradle plugin during configuration. Hook them by name
+        // so we run *after* the bundle is on disk.
+        def bundleTaskName = "createBundle${capitalized}JsAndAssets"
+        def parent = tasks.findByName(bundleTaskName)
+        if (parent == null) {
+            project.logger.lifecycle("[allstak] no ${bundleTaskName} task found — skipping sourcemap upload for ${variantName}")
+            return
+        }
+
+        def uploadTask = tasks.create("allstakUpload${capitalized}Sourcemaps", Exec) {
+            group = 'AllStak'
+            description = "Inject debug-id and (optionally) upload Hermes/Metro sourcemap for the ${variantName} variant."
+
+            // Metro+Hermes paths the React Native gradle plugin uses by default.
+            // We accept the conventional defaults; users can override via project props.
+            def jsBundleDir = project.findProperty('allstakBundleDir') ?:
+                file("${buildDir}/generated/assets/${bundleTaskName}").absolutePath
+            def mapDir = project.findProperty('allstakMapDir') ?:
+                file("${buildDir}/generated/sourcemaps/react/${variantName}").absolutePath
+
+            // Pick the right pair (Hermes emits .bundle + .bundle.map after compose).
+            doFirst {
+                def bundleCandidates = [
+                    Paths.get(jsBundleDir.toString(), 'index.android.bundle'),
+                    Paths.get(jsBundleDir.toString(), 'index.android.jsbundle'),
+                ]
+                def mapCandidates = [
+                    Paths.get(mapDir.toString(), 'index.android.bundle.map'),
+                    Paths.get(mapDir.toString(), 'index.android.bundle.composed.map'),
+                ]
+                def bundle = bundleCandidates.find { Files.exists(it) }
+                def mapFile = mapCandidates.find { Files.exists(it) }
+
+                if (bundle == null || mapFile == null) {
+                    project.logger.warn("[allstak] no bundle/sourcemap pair found for ${variantName}: " +
+                            "tried ${bundleCandidates}, ${mapCandidates}")
+                    enabled = false
+                    return
+                }
+
+                def releaseProp = project.findProperty('allstakRelease') ?:
+                    System.getenv('ALLSTAK_RELEASE')
+                def tokenProp = project.findProperty('allstakUploadToken') ?:
+                    System.getenv('ALLSTAK_UPLOAD_TOKEN')
+                def hostProp = project.findProperty('allstakHost') ?:
+                    System.getenv('ALLSTAK_HOST')
+                def distProp = project.findProperty('allstakDist') ?:
+                    System.getenv('ALLSTAK_DIST_OVERRIDE') ?:
+                    'android-hermes'
+
+                if (releaseProp == null) {
+                    project.logger.warn("[allstak] no allstakRelease / ALLSTAK_RELEASE set — skipping sourcemap step")
+                    enabled = false
+                    return
+                }
+
+                // Resolve the helper script that ships inside the SDK package.
+                def hookScript = project.findProperty('allstakHookScript') ?:
+                    project.rootDir.toPath()
+                        .resolve('../node_modules/@allstak/react-native/build-hooks/upload-sourcemaps.js')
+                        .normalize()
+                        .toString()
+
+                if (!Files.exists(Paths.get(hookScript))) {
+                    project.logger.warn("[allstak] hook script not found at ${hookScript} — is @allstak/react-native installed?")
+                    enabled = false
+                    return
+                }
+
+                environment 'ALLSTAK_RELEASE', releaseProp
+                if (tokenProp) environment 'ALLSTAK_UPLOAD_TOKEN', tokenProp
+                if (hostProp)  environment 'ALLSTAK_HOST', hostProp
+
+                commandLine 'node', hookScript,
+                    '--bundle', bundle.toString(),
+                    '--sourcemap', mapFile.toString(),
+                    '--platform', 'android',
+                    '--dist', distProp
+
+                project.logger.lifecycle("[allstak] uploading sourcemap for ${variantName}: ${bundle} (release=${releaseProp})")
+            }
+
+            // Don't fail the build — log and continue.
+            ignoreExitValue = true
+        }
+
+        // Run AFTER the bundle exists. We hook the bundle task's
+        // doLast so the artifact is on disk; finalizedBy ensures we
+        // run even if the user invoked just :app:bundleRelease.
+        parent.finalizedBy(uploadTask)
+    }
+}

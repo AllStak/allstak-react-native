@@ -1,7 +1,9 @@
 // Standard React Native module Gradle build file. Picked up by RN
 // autolinking via ../../react-native.config.js (sourceDir).
 buildscript {
-  ext.kotlin_version = ext.kotlin_version ?: '1.9.22'
+  ext.kotlin_version = rootProject.ext.has('kotlinVersion')
+    ? rootProject.ext.get('kotlinVersion')
+    : (rootProject.ext.has('kotlin_version') ? rootProject.ext.get('kotlin_version') : '1.9.22')
   repositories {
     google()
     mavenCentral()

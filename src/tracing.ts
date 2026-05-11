@@ -188,6 +188,7 @@ export class TracingModule {
     }
     if (!this.flushTimer) {
       this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+      (this.flushTimer as any)?.unref?.();
     }
   }
 

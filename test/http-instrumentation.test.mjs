@@ -20,6 +20,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const sent = [];
+const externalRequests = [];
 let nextFetchBehavior = 'success'; // 'success' | 'fail' | 'status:NNN'
 let nextResponseBody = 'ok';
 let nextResponseStatus = 200;
@@ -31,6 +32,7 @@ const baseFetch = async (url, init) => {
     sent.push({ url: u, init });
     return new Response('{}', { status: 200 });
   }
+  externalRequests.push({ url: u, init });
   if (nextFetchBehavior === 'fail') throw new Error('network down');
   let status = nextResponseStatus;
   if (nextFetchBehavior.startsWith('status:')) status = parseInt(nextFetchBehavior.slice(7), 10);
@@ -58,11 +60,28 @@ const errPath = (s) => /\/ingest\/v1\/errors$/.test(s.url);
 const allHttpEvents = () => sent
   .filter(httpPath)
   .flatMap((s) => JSON.parse(s.init.body).requests);
+const allSpanEvents = () => sent
+  .filter((s) => /\/ingest\/v1\/spans$/.test(s.url))
+  .flatMap((s) => JSON.parse(s.init.body).spans);
+const allReplayEvents = () => sent
+  .filter((s) => /\/ingest\/v1\/replay$/.test(s.url))
+  .flatMap((s) => JSON.parse(s.init.body).events);
+const headerValue = (headers, name) => {
+  if (!headers) return undefined;
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) return headers.get(name);
+  if (Array.isArray(headers)) {
+    const entry = headers.find(([k]) => String(k).toLowerCase() === name.toLowerCase());
+    return entry?.[1];
+  }
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase());
+  return key ? headers[key] : undefined;
+};
 
 // ───────────────────────────────────────────────────────────────
 
 test('1. fetch success — captures method/url/status/duration; body+headers OFF by default', async () => {
   sent.length = 0;
+  externalRequests.length = 0;
   AllStak.init({ apiKey: 'k', release: 'r', enableHttpTracking: true });
   await fetch('https://api.example.com/users');
   AllStak.destroy();
@@ -77,6 +96,10 @@ test('1. fetch success — captures method/url/status/duration; body+headers OFF
   assert.equal(e.requestBody, undefined, 'body OFF by default');
   assert.equal(e.responseBody, undefined, 'body OFF by default');
   assert.equal(e.requestHeaders, undefined, 'headers OFF by default');
+  const outbound = externalRequests.find((r) => r.url.includes('/users'));
+  assert.ok(headerValue(outbound.init.headers, 'traceparent'), 'fetch must inject traceparent');
+  assert.equal(headerValue(outbound.init.headers, 'x-allstak-trace-id'), e.traceId);
+  assert.equal(headerValue(outbound.init.headers, 'x-allstak-request-id'), e.requestId);
 });
 
 test('2. fetch failure — records error string and re-throws', async () => {
@@ -123,6 +146,44 @@ test('4. fetch POST with body capture ON — body present + truncated to maxBody
   assert.ok(e.requestBody.length <= 16 + '…[truncated]'.length, 'body must be truncated');
   assert.match(e.requestBody, /…\[truncated\]$/);
   assert.match(e.responseBody, /…\[truncated\]$/);
+  assert.equal(e.requestBodyStatus, 'truncated');
+  assert.equal(e.responseBodyStatus, 'truncated');
+  assert.equal(e.requestBodyTruncated, true);
+  nextResponseBody = 'ok';
+});
+
+test('4b. recursive JSON body redaction masks sensitive fields and reports metadata', async () => {
+  sent.length = 0;
+  AllStak.init({
+    apiKey: 'k',
+    enableHttpTracking: true,
+    httpTracking: {
+      captureRequestBody: true,
+      captureResponseBody: true,
+      captureHeaders: true,
+      maxBodyBytes: 4096,
+    },
+  });
+  nextResponseBody = JSON.stringify({ token: 'server-secret', ok: false });
+  await fetch('https://api.example.com/redact', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      password: 'secret',
+      nested: { otp: '11111', card: '4111111111111111' },
+      safe: 'visible',
+    }),
+  });
+  AllStak.destroy();
+  await wait(20);
+  const e = allHttpEvents().find((x) => x.path === '/redact');
+  assert.match(e.requestBody, /\[REDACTED\]/);
+  assert.match(e.responseBody, /\[REDACTED\]/);
+  assert.ok(!JSON.stringify(e).includes('4111111111111111'));
+  assert.deepEqual(e.requestBodyRedactedFields, ['nested.card', 'nested.otp', 'password']);
+  assert.deepEqual(e.responseBodyRedactedFields, ['token']);
+  assert.equal(e.requestBodyStatus, 'redacted');
+  assert.equal(e.responseBodyStatus, 'redacted');
   nextResponseBody = 'ok';
 });
 
@@ -177,8 +238,9 @@ test('7+8. XHR success + failure — wraps open/send/setRequestHeader', async ()
   // Build a minimal XMLHttpRequest stub that the patcher can wrap.
   const xhrEvents = new Map();
   class FakeXHR {
+    constructor() { this.headers = {}; }
     open(method, url) { this._m = method; this._u = url; }
-    setRequestHeader() {}
+    setRequestHeader(k, v) { this.headers[String(k).toLowerCase()] = String(v); }
     send() {
       // After patching, send() registers listeners. Fire 'load' synchronously.
       setTimeout(() => {
@@ -216,6 +278,9 @@ test('7+8. XHR success + failure — wraps open/send/setRequestHeader', async ()
   const failEv = events.find((e) => e.url.includes('xhr-fail'));
   assert.ok(okEv, 'XHR success event recorded');
   assert.equal(okEv.statusCode, 200);
+  assert.equal(ok.headers['x-allstak-request-id'], okEv.requestId);
+  assert.equal(ok.headers['x-allstak-trace-id'], okEv.traceId);
+  assert.ok(ok.headers.traceparent);
   assert.ok(failEv, 'XHR failure event recorded');
   assert.equal(failEv.error, 'network');
   delete globalThis.XMLHttpRequest;
@@ -246,6 +311,38 @@ test('9. axios manual instrumentation — interceptors capture request', async (
   assert.ok(e, 'axios event recorded');
   assert.equal(e.method, 'POST');
   assert.equal(e.statusCode, 200);
+  assert.equal(headerValue(cfg.headers, 'x-allstak-request-id'), e.requestId);
+  assert.equal(headerValue(cfg.headers, 'x-allstak-trace-id'), e.traceId);
+  assert.ok(headerValue(cfg.headers, 'traceparent'));
+});
+
+test('9b. mobile.http span and timeline marker reuse request IDs from outbound headers', async () => {
+  sent.length = 0;
+  externalRequests.length = 0;
+  AllStak.init({
+    apiKey: 'k',
+    release: 'rn-release',
+    dist: 'android-hermes',
+    platform: 'react-native',
+    enableHttpTracking: true,
+    replay: { sampleRate: 1 },
+  });
+  nextFetchBehavior = 'status:500';
+  await fetch('https://api.example.com/fullstack-fail', { method: 'POST' });
+  nextFetchBehavior = 'success';
+  AllStak.destroy();
+  await wait(20);
+  const request = allHttpEvents().find((e) => e.path === '/fullstack-fail');
+  const span = allSpanEvents().find((s) => s.operation === 'mobile.http' && s.tags?.requestId === request.requestId);
+  const marker = allReplayEvents().find((e) => e.k === 'exception' && e.data?.requestId === request.requestId);
+  const outbound = externalRequests.find((r) => r.url.includes('/fullstack-fail'));
+  assert.ok(request, 'request event exists');
+  assert.ok(span, 'mobile.http span exists');
+  assert.equal(span.traceId, request.traceId);
+  assert.equal(span.status, 'error');
+  assert.equal(headerValue(outbound.init.headers, 'x-allstak-request-id'), request.requestId);
+  assert.ok(marker, 'Mobile Session Timeline request-failed marker exists');
+  assert.equal(marker.data.traceId, request.traceId);
 });
 
 test('10. idempotent patching — second init does NOT double-fire', async () => {
@@ -329,12 +426,15 @@ test('13. recent failed request attached to next captureException', async () => 
   const errPayload = sent.find(errPath);
   assert.ok(errPayload, 'exception was captured');
   const body = JSON.parse(errPayload.init.body);
+  assert.ok(body.requestId, 'exception top-level requestId must be populated from failed request context');
+  assert.ok(body.traceId, 'exception top-level traceId must be populated from failed request context');
   const recent = body.metadata?.['http.recentFailed'];
   assert.ok(Array.isArray(recent) && recent.length >= 2,
     'recent failed http requests must be attached to the error metadata');
   const urls = recent.map((r) => r.url);
   assert.ok(urls.some((u) => u.includes('checkout-fail')));
   assert.ok(urls.some((u) => u.includes('network-down')));
+  assert.equal(body.metadata?.['http.linkConfidence'], 'inferred');
   // Bodies must NOT leak when capture is off
   for (const r of recent) {
     assert.ok(!('requestBody' in r), 'no body in recent-failed snapshot when body capture is OFF');
