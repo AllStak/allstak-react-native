@@ -31,9 +31,9 @@
  * CI dry-runs or when you don't have an upload token yet).
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 export const DEFAULT_HOST = 'https://api.allstak.sa';
 
@@ -167,7 +167,8 @@ export async function uploadReactNativeSourcemap(
   const inject = injectReactNativeSourcemap(opts);
   log(`bundle: ${basename(opts.bundle)}  debugId: ${inject.debugId} ${inject.reused ? '(reused)' : '(new)'}`);
 
-  const token = opts.token ?? process.env.ALLSTAK_UPLOAD_TOKEN;
+  const env = loadAllStakEnv();
+  const token = opts.token ?? env.ALLSTAK_UPLOAD_TOKEN;
   if (opts.injectOnly || !token) {
     if (!opts.injectOnly && !token) {
       log('skipping upload — no token (set ALLSTAK_UPLOAD_TOKEN or pass `token`)');
@@ -175,7 +176,7 @@ export async function uploadReactNativeSourcemap(
     return inject;
   }
 
-  const host = opts.host ?? process.env.ALLSTAK_HOST ?? DEFAULT_HOST;
+  const host = opts.host ?? env.ALLSTAK_HOST ?? DEFAULT_HOST;
   const stripSources = opts.stripSources ?? false;
 
   const steps: UploadReactNativeSourcemapResult['steps'] = [];
@@ -206,4 +207,20 @@ export async function uploadReactNativeSourcemap(
   }
 
   return { ...inject, uploaded: allOk, steps };
+}
+
+function loadAllStakEnv(): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = { ...process.env };
+  for (const file of ['.env.local', '.env']) {
+    const full = resolve(process.cwd(), file);
+    if (!existsSync(full)) continue;
+    for (const line of readFileSync(full, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const match = /^([A-Z0-9_]+)\s*=\s*(.*)$/.exec(trimmed);
+      if (!match || out[match[1]!] !== undefined) continue;
+      out[match[1]!] = match[2]!.replace(/^['"]|['"]$/g, '');
+    }
+  }
+  return out;
 }

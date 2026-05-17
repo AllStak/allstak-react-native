@@ -36,6 +36,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+loadDotEnv();
 const args = parseArgs(process.argv.slice(2));
 
 const RELEASE = process.env.ALLSTAK_RELEASE;
@@ -172,4 +173,18 @@ function guessDist(platform) {
   if (platform === 'ios') return 'ios-hermes';
   if (platform === 'android') return 'android-hermes';
   return platform;
+}
+
+function loadDotEnv() {
+  for (const file of ['.env.local', '.env']) {
+    const full = path.resolve(process.cwd(), file);
+    if (!fs.existsSync(full)) continue;
+    for (const line of fs.readFileSync(full, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const match = /^([A-Z0-9_]+)\s*=\s*(.*)$/.exec(trimmed);
+      if (!match || process.env[match[1]] !== undefined) continue;
+      process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+    }
+  }
 }
