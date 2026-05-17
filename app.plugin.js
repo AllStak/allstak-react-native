@@ -3,4 +3,6 @@
 // app.json and Expo's `withPlugins` resolver finds it without an extra
 // import path. Expo looks for `app.plugin.js` at the package root by
 // convention.
-module.exports = require('./dist/expo-plugin.js');
+const plugin = require('./dist/expo-plugin.js');
+
+module.exports = plugin.default || plugin;

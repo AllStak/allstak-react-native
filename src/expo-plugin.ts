@@ -67,19 +67,10 @@ function withAllStak(config: ExpoConfig & ExpoConfigContext, options: AllStakExp
     release: options.release ?? existing.release,
     environment: options.environment ?? existing.environment,
     dist: options.dist ?? existing.dist,
-    pluginVersion: '0.3.1',
+    pluginVersion: '0.3.2',
   };
 
   return next;
 }
 
 export default withAllStak;
-
-// Expose as a CommonJS function so `app.plugin.js`'s `require('./dist/expo-plugin.js')`
-// returns the plugin directly. The `declare const module` keeps the TS
-// type-checker happy without dragging in @types/node.
-declare const module: { exports: any };
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = withAllStak;
-  module.exports.default = withAllStak;
-}

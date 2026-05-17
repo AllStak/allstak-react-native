@@ -18,6 +18,7 @@ import { createRequire } from 'node:module';
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(here, '..');
 const require = createRequire(import.meta.url);
+const pkg = require(join(pkgRoot, 'package.json'));
 
 test('app.plugin.js exists at the package root', () => {
   assert.ok(existsSync(join(pkgRoot, 'app.plugin.js')),
@@ -50,7 +51,7 @@ test('plugin stamps extra._allstak with release/environment/dist/pluginVersion',
     release: 'mobile@2.0.0',
     environment: 'production',
     dist: 'ios-hermes',
-    pluginVersion: '0.3.1',
+    pluginVersion: pkg.version,
   });
 });
 

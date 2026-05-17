@@ -20,7 +20,7 @@ import type { ConsoleCaptureOptions } from './auto-breadcrumbs';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.3.1';
+export const SDK_VERSION = '0.3.2';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';

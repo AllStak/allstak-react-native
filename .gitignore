@@ -2,6 +2,9 @@ node_modules/
 dist/
 *.log
 .env
+.env.*
+.npmrc
+*.tgz
 .venv/
 vendor/
 .DS_Store

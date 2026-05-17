@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "AllStak Expo Demo",
+    "slug": "allstak-expo-demo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "platforms": ["ios", "android"],
+    "plugins": [
+      "@allstak/react-native/app.plugin"
+    ]
+  }
+}
