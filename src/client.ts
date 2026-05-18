@@ -34,7 +34,7 @@ import { detectRuntimeMode } from './runtime';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.4.0';
+export const SDK_VERSION = '0.4.1';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';

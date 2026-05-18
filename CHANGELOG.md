@@ -5,6 +5,21 @@ All notable changes to `@allstak/react-native` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-18
+
+### Fixed
+
+- Masking primitives (`AllStakMaskedView`, `AllStakPrivacyView`,
+  `AllStakTextInput`, `AllStakSensitiveText`) now resolve the
+  `react-native` module reference lazily at render time instead of
+  at module-load time. Caught during simulator cert: Metro bundles
+  `react-native` separately from the SDK, so a top-of-file
+  `require('react-native')` could resolve to a stale stub and cause
+  `View config getter callback for component TextInput must be a function`
+  red-screens in dev. Render-time resolution fixes this on every
+  Metro reload.
+- Provider's root-view wrapper uses the same lazy resolution.
+
 ## [0.4.0] — 2026-05-18
 
 ### Added

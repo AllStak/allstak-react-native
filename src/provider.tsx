@@ -13,8 +13,11 @@ import type {
 } from './screenshot';
 import { tryRequire } from './runtime';
 
-const RN: any = tryRequire('react-native');
-const RootView: any = RN?.View ?? (((props: any) => React.createElement('View', props)) as any);
+function getRN(): any { return tryRequire('react-native'); }
+function getRootView(): any {
+  const RN = getRN();
+  return RN?.View;
+}
 
 export interface AllStakProviderProps extends ReactNativeInstallOptions {
   children: React.ReactNode;
@@ -274,7 +277,8 @@ export function AllStakProvider({
       {children}
     </AllStakErrorBoundary>
   );
-  const wrapped = RN
+  const RootView = getRootView();
+  const wrapped = RootView
     ? React.createElement(
         RootView,
         { ref: rootRef, style: { flex: 1 }, collapsable: false },

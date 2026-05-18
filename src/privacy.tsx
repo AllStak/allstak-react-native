@@ -18,7 +18,10 @@ import * as React from 'react';
 import { tryRequire } from './runtime';
 
 // Lazy-require react-native so JS-only test runners don't crash.
-const RN: any = tryRequire('react-native');
+// We MUST resolve at call time (not module-load time) because Metro
+// bundles `react-native` and rewrites the module map; a cached
+// reference from module-load can resolve to a stale shim.
+function getRN(): any { return tryRequire('react-native'); }
 
 export type PrivacyLevel = 'mask' | 'hide' | 'show';
 
@@ -90,9 +93,18 @@ export function useAllStakPrivacy(): {
 
 // ── Component wrappers ──────────────────────────────────────────────
 
-const View: any = RN?.View ?? (((props: any) => React.createElement('View', props)) as any);
-const Text: any = RN?.Text ?? (((props: any) => React.createElement('Text', props)) as any);
-const TextInput: any = RN?.TextInput ?? (((props: any) => React.createElement('TextInput', props)) as any);
+function getView(): any {
+  const RN = getRN();
+  return RN?.View ?? ((props: any) => React.createElement(React.Fragment, null, props.children));
+}
+function getText(): any {
+  const RN = getRN();
+  return RN?.Text ?? ((props: any) => React.createElement(React.Fragment, null, props.children));
+}
+function getTextInput(): any {
+  const RN = getRN();
+  return RN?.TextInput ?? ((props: any) => React.createElement(React.Fragment, null, null));
+}
 
 const DEFAULT_MASK_COLOR = '#d8dde7';
 const DEFAULT_MASK_LABEL = '••••••';
@@ -125,6 +137,8 @@ export function AllStakMaskedView({
   const isCapturing = useIsCapturing();
   // 'show' always passes through; 'hide' renders nothing during capture;
   // 'mask' (default) renders the placeholder during capture.
+  const View = getView();
+  const Text = getText();
   if (!isCapturing || privacy === 'show') {
     return React.createElement(View, { style, ...rest }, children);
   }
@@ -164,6 +178,8 @@ export function AllStakTextInput({
   ...rest
 }: AllStakTextInputProps): React.ReactElement {
   const isCapturing = useIsCapturing();
+  const View = getView();
+  const TextInput = getTextInput();
   if (isCapturing && privacy !== 'show') {
     return React.createElement(View, {
       style: [{ minHeight: 40, backgroundColor: maskColor, borderRadius: 4 }, style],
@@ -192,6 +208,7 @@ export function AllStakSensitiveText({
   ...rest
 }: AllStakSensitiveTextProps): React.ReactElement {
   const isCapturing = useIsCapturing();
+  const Text = getText();
   if (isCapturing && privacy !== 'show') {
     return React.createElement(Text, { style, ...rest }, maskLabel);
   }
