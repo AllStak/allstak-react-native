@@ -17,10 +17,24 @@ import { HttpRequestModule } from './http-requests';
 import type { HttpTrackingOptions } from './http-redact';
 import { installHttpInstrumentation, unbindHttpInstrumentation } from './http-instrumentation';
 import type { ConsoleCaptureOptions } from './auto-breadcrumbs';
+import {
+  resolveScreenshotConfig,
+  pickScreenshotConfig,
+  maybeCaptureScreenshot,
+  warnIfBothApisPresent,
+  type ScreenshotConfig,
+  type ScreenshotRedactionMode,
+  type ScreenshotMaskStyle,
+  type ScreenshotFormat,
+  type ScreenshotNativeMode,
+  type ScreenshotFailPolicy,
+  type ScreenshotContext,
+} from './screenshot';
+import { detectRuntimeMode } from './runtime';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.3.1';
+export const SDK_VERSION = '0.4.0';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';
@@ -108,6 +122,25 @@ export interface AllStakConfig {
    * hurt app navigation, JS thread responsiveness, or telemetry delivery.
    */
   screenshot?: ScreenshotCaptureOptions;
+
+  // ── Flat screenshot API (preferred; wizard 0.1.16+ writes these) ────
+  /** Enable on-error screenshot capture. Default: false. */
+  captureScreenshotOnError?: boolean;
+  screenshotRedaction?: ScreenshotRedactionMode;
+  screenshotMaskStyle?: ScreenshotMaskStyle;
+  screenshotMaxBytes?: number;
+  screenshotQuality?: number;
+  screenshotFormat?: ScreenshotFormat;
+  screenshotSampleRate?: number;
+  screenshotOnUnhandledOnly?: boolean;
+  screenshotUploadTimeoutMs?: number;
+  screenshotCaptureTimeoutMs?: number;
+  screenshotNativeMode?: ScreenshotNativeMode;
+  screenshotFailPolicy?: ScreenshotFailPolicy;
+  beforeScreenshotCapture?: ScreenshotConfig['beforeScreenshotCapture'];
+  beforeScreenshotUpload?: ScreenshotConfig['beforeScreenshotUpload'];
+  isScreenshotAllowed?: ScreenshotConfig['isScreenshotAllowed'];
+
   /** SDK identity overrides (set automatically by installReactNative). */
   sdkName?: string;
   sdkVersion?: string;
@@ -376,6 +409,24 @@ export class AllStakClient {
       fingerprint: eff.fingerprint,
     };
 
+    // Flat screenshot API path (preferred). Warn once if both APIs are
+    // configured; flat wins.
+    const flatPresent = this.config.captureScreenshotOnError === true;
+    const callbackPresent = Boolean(this.config.screenshot?.provider);
+    warnIfBothApisPresent(callbackPresent, flatPresent);
+
+    if (flatPresent) {
+      void this.runFlatScreenshotPipeline(error, payload).catch(() => {
+        // Pipeline is fail-open, but belt-and-braces: ensure the event
+        // ships even if something inside throws synchronously.
+        void this.sendThroughBeforeSend({
+          ...payload,
+          metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'failed' },
+        });
+      });
+      return;
+    }
+
     if (this.shouldCaptureScreenshot()) {
       void this.withScreenshotMetadata(error, payload)
         .then((enriched) => this.sendThroughBeforeSend(enriched))
@@ -392,6 +443,98 @@ export class AllStakClient {
         'screenshot.status': this.config.screenshot?.enabled ? 'unsupported' : 'disabled',
       },
     });
+  }
+
+  /**
+   * Flat screenshot API path. Capture first (so masking primitives can
+   * swap), send the event with a `screenshot.status` metadata tag, read
+   * back the server-assigned errorId, then upload the attachment.
+   *
+   * Fail-open at every step.
+   */
+  private async runFlatScreenshotPipeline(
+    error: Error,
+    payload: ErrorIngestPayload,
+  ): Promise<void> {
+    const sc = resolveScreenshotConfig(pickScreenshotConfig(this.config as unknown as Record<string, unknown>));
+    const runtimeMode = detectRuntimeMode();
+    const ctx: ScreenshotContext = { error, unhandled: true, runtimeMode };
+
+    let captured: Awaited<ReturnType<typeof maybeCaptureScreenshot>> = null;
+    try {
+      captured = await maybeCaptureScreenshot(sc, ctx);
+    } catch { captured = null; }
+
+    const status: string = !sc.captureScreenshotOnError
+      ? 'disabled'
+      : captured
+        ? 'captured'
+        : runtimeMode === 'expo-go'
+          ? 'unsupported_runtime'
+          : 'unavailable';
+
+    const eventPayload: ErrorIngestPayload = {
+      ...payload,
+      metadata: {
+        ...(payload.metadata ?? {}),
+        'screenshot.status': status,
+        'screenshot.runtimeMode': runtimeMode,
+        ...(captured ? {
+          'screenshot.contentType': captured.upload.contentType,
+          'screenshot.width': captured.upload.width,
+          'screenshot.height': captured.upload.height,
+          'screenshot.sizeBytes': captured.upload.sizeBytes,
+          'screenshot.redactionMode': captured.metadata.redactionMode,
+          'screenshot.maskStyle': captured.metadata.maskStyle,
+          'screenshot.captureMethod': captured.metadata.captureMethod,
+        } : {}),
+      },
+    };
+
+    // Send the event and capture the server-assigned id so we can attach.
+    let finalPayload: ErrorIngestPayload | null | undefined = eventPayload;
+    if (this.config.beforeSend) {
+      try { finalPayload = await this.config.beforeSend(eventPayload); }
+      catch { finalPayload = eventPayload; }
+    }
+    if (!finalPayload) return;
+
+    let eventId: string | null = null;
+    try {
+      const resp = await this.transport.sendAndRead<{ data?: { id?: string }; id?: string }>(
+        ERRORS_PATH, finalPayload, { timeoutMs: 5000, retries: 1 },
+      );
+      eventId = resp?.data?.id ?? resp?.id ?? null;
+    } catch { /* fail-open */ }
+
+    if (!captured || !eventId) return;
+
+    // Upload attachment with separate timeout / bounded retries.
+    try {
+      await this.transport.sendAndRead(
+        `/ingest/v1/errors/${encodeURIComponent(eventId)}/attachments`,
+        {
+          kind: 'screenshot',
+          contentType: captured.upload.contentType,
+          dataBase64: captured.upload.dataBase64,
+          width: captured.upload.width,
+          height: captured.upload.height,
+          redactionMode: captured.metadata.redactionMode,
+          captureMethod: captured.metadata.captureMethod,
+          sizeBytes: captured.upload.sizeBytes,
+          metadata: {
+            maskStyle: captured.metadata.maskStyle,
+            format: captured.metadata.format,
+            runtimeMode: captured.metadata.runtimeMode,
+            privacyComponentsDetected: captured.metadata.privacyComponentsDetected ?? 0,
+            sdkVersion: SDK_VERSION,
+          },
+        },
+        { timeoutMs: sc.screenshotUploadTimeoutMs, retries: 2 },
+      );
+    } catch {
+      // Fail-open — event already sent.
+    }
   }
 
   /** Start a new span. Auto-parented to any currently-active span. */

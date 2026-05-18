@@ -40,6 +40,45 @@ export type { AllStakConfig, Breadcrumb, ScreenshotArtifact, ScreenshotCaptureOp
 export type { TransportStats } from './transport';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
 
+// ── Flat screenshot API + masking primitives (0.4.0+) ───────────
+export {
+  AllStakMaskedView,
+  AllStakPrivacyView,
+  AllStakTextInput,
+  AllStakSensitiveText,
+  useAllStakPrivacy,
+  registerSensitiveRef,
+  isCapturingScreenshot,
+  __resetPrivacyStateForTest,
+} from './privacy';
+export type {
+  AllStakMaskedViewProps,
+  AllStakTextInputProps,
+  AllStakSensitiveTextProps,
+  PrivacyLevel,
+} from './privacy';
+export {
+  resolveScreenshotConfig,
+  pickScreenshotConfig,
+  maybeCaptureScreenshot,
+  captureViaViewShot,
+  isViewShotAvailable,
+  DEFAULT_SCREENSHOT_CONFIG,
+} from './screenshot';
+export type {
+  ScreenshotConfig,
+  ScreenshotContext,
+  ScreenshotMetadata,
+  ScreenshotUpload,
+  ScreenshotRedactionMode,
+  ScreenshotMaskStyle,
+  ScreenshotFormat,
+  ScreenshotNativeMode,
+  ScreenshotFailPolicy,
+} from './screenshot';
+export { detectRuntimeMode, runtimeAllowsScreenshot, __resetRuntimeModeForTest } from './runtime';
+export type { RuntimeMode } from './runtime';
+
 // ── React Native integrations (used internally by AllStakProvider) ──
 export { installReactNative } from './install';
 export type { ReactNativeInstallOptions } from './install';

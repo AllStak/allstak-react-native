@@ -5,6 +5,44 @@ All notable changes to `@allstak/react-native` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-18
+
+### Added
+
+- **Flat screenshot API** on `AllStakProvider` and `AllStak.init()`:
+  `captureScreenshotOnError`, `screenshotRedaction`,
+  `screenshotMaskStyle`, `screenshotMaxBytes`, `screenshotQuality`,
+  `screenshotFormat`, `screenshotSampleRate`,
+  `screenshotOnUnhandledOnly`, `screenshotUploadTimeoutMs`,
+  `screenshotCaptureTimeoutMs`, `screenshotNativeMode`,
+  `screenshotFailPolicy`, `beforeScreenshotCapture`,
+  `beforeScreenshotUpload`, `isScreenshotAllowed`. Matches the props
+  the AllStak wizard (`@allstak/wizard@>=0.1.16`) writes — no manual
+  callback wiring required.
+- **Masking primitives** for privacy-safe captures:
+  `AllStakMaskedView`, `AllStakPrivacyView`, `AllStakTextInput`,
+  `AllStakSensitiveText`, plus the `useAllStakPrivacy()` hook.
+- **Native capture via `react-native-view-shot`** as an optional peer
+  dependency. The SDK lazy-requires it; absence is a silent no-op
+  (event still ships).
+- **Runtime detection** (`detectRuntimeMode`): `expo-go` |
+  `expo-dev-client` | `rn-cli` | `unknown`. Expo Go is detected and
+  screenshots are skipped silently with status
+  `screenshot.status: unsupported_runtime`.
+- **Attachment upload pipeline** posts the captured image to
+  `POST /ingest/v1/errors/{eventId}/attachments` (JSON / base64 wire
+  format) with capture metadata. Bounded retries, per-attempt timeout,
+  fail-open at every step.
+
+### Changed
+
+- `AllStakProvider` now wraps `children` in a ref'd root view so
+  view-shot can capture by reference. Backward-compatible.
+- The callback-based `config.screenshot.provider` API from 0.3.x is
+  retained for backward compatibility; if both APIs are configured the
+  flat API wins and a one-time deprecation warning is logged.
+- Bumped `SDK_VERSION` to `0.4.0`.
+
 ## [0.3.1] — 2026-05-11
 
 ### Added

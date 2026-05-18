@@ -3,6 +3,18 @@ import { AllStak, AllStakClient } from './client';
 import type { AllStakConfig } from './client';
 import { installReactNative } from './install';
 import type { ReactNativeInstallOptions } from './install';
+import { __setRootViewRef } from './screenshot';
+import type {
+  ScreenshotRedactionMode,
+  ScreenshotMaskStyle,
+  ScreenshotFormat,
+  ScreenshotNativeMode,
+  ScreenshotFailPolicy,
+} from './screenshot';
+import { tryRequire } from './runtime';
+
+const RN: any = tryRequire('react-native');
+const RootView: any = RN?.View ?? (((props: any) => React.createElement('View', props)) as any);
 
 export interface AllStakProviderProps extends ReactNativeInstallOptions {
   children: React.ReactNode;
@@ -44,6 +56,23 @@ export interface AllStakProviderProps extends ReactNativeInstallOptions {
     | React.ReactNode
     | ((props: { error: Error; resetError: () => void }) => React.ReactNode);
   onError?: (error: Error, componentStack?: string) => void;
+
+  // ── Flat screenshot API (wizard 0.1.16+ writes these) ─────────────
+  captureScreenshotOnError?: boolean;
+  screenshotRedaction?: ScreenshotRedactionMode;
+  screenshotMaskStyle?: ScreenshotMaskStyle;
+  screenshotMaxBytes?: number;
+  screenshotQuality?: number;
+  screenshotFormat?: ScreenshotFormat;
+  screenshotSampleRate?: number;
+  screenshotOnUnhandledOnly?: boolean;
+  screenshotUploadTimeoutMs?: number;
+  screenshotCaptureTimeoutMs?: number;
+  screenshotNativeMode?: ScreenshotNativeMode;
+  screenshotFailPolicy?: ScreenshotFailPolicy;
+  beforeScreenshotCapture?: AllStakConfig['beforeScreenshotCapture'];
+  beforeScreenshotUpload?: AllStakConfig['beforeScreenshotUpload'];
+  isScreenshotAllowed?: AllStakConfig['isScreenshotAllowed'];
 }
 
 interface ErrorBoundaryState {
@@ -134,8 +163,30 @@ export function AllStakProvider({
   autoFetchBreadcrumbs,
   autoConsoleBreadcrumbs,
   autoNavigationBreadcrumbs,
+  captureScreenshotOnError,
+  screenshotRedaction,
+  screenshotMaskStyle,
+  screenshotMaxBytes,
+  screenshotQuality,
+  screenshotFormat,
+  screenshotSampleRate,
+  screenshotOnUnhandledOnly,
+  screenshotUploadTimeoutMs,
+  screenshotCaptureTimeoutMs,
+  screenshotNativeMode,
+  screenshotFailPolicy,
+  beforeScreenshotCapture,
+  beforeScreenshotUpload,
+  isScreenshotAllowed,
 }: AllStakProviderProps): React.ReactElement {
   const clientRef = React.useRef<AllStakClient | null>(null);
+  const rootRef = React.useRef<any>(null);
+
+  // Make the root ref discoverable by the screenshot capture path.
+  React.useEffect(() => {
+    __setRootViewRef(rootRef);
+    return () => { __setRootViewRef(null); };
+  }, []);
 
   if (!clientRef.current) {
     // If a previous provider mount left an instance live, reuse it. This
@@ -165,6 +216,21 @@ export function AllStakProvider({
         tracesSampleRate,
         service,
         dist,
+        captureScreenshotOnError,
+        screenshotRedaction,
+        screenshotMaskStyle,
+        screenshotMaxBytes,
+        screenshotQuality,
+        screenshotFormat,
+        screenshotSampleRate,
+        screenshotOnUnhandledOnly,
+        screenshotUploadTimeoutMs,
+        screenshotCaptureTimeoutMs,
+        screenshotNativeMode,
+        screenshotFailPolicy,
+        beforeScreenshotCapture,
+        beforeScreenshotUpload,
+        isScreenshotAllowed,
       };
       clientRef.current = AllStak.init(config);
       __providerOwnedInstance = clientRef.current;
@@ -200,11 +266,25 @@ export function AllStakProvider({
     };
   }, [destroyOnUnmount, debug]);
 
+  // Wrap children in a ref'd root view so view-shot can capture by ref.
+  // Use collapsable={false} on Android to avoid the view being optimized
+  // away by Yoga when it has no styles of its own.
+  const boundary = (
+    <AllStakErrorBoundary fallback={fallback} onError={onError} debug={debug}>
+      {children}
+    </AllStakErrorBoundary>
+  );
+  const wrapped = RN
+    ? React.createElement(
+        RootView,
+        { ref: rootRef, style: { flex: 1 }, collapsable: false },
+        boundary,
+      )
+    : boundary;
+
   return (
     <AllStakContext.Provider value={clientRef.current}>
-      <AllStakErrorBoundary fallback={fallback} onError={onError} debug={debug}>
-        {children}
-      </AllStakErrorBoundary>
+      {wrapped}
     </AllStakContext.Provider>
   );
 }

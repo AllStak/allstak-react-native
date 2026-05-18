@@ -7,6 +7,8 @@
  * No window, no AbortController fallback shims — RN exposes both natively.
  */
 
+declare const __DEV__: boolean | undefined;
+
 const REQUEST_TIMEOUT = 2000;
 const MAX_BUFFER = 100;
 const FAILURE_THRESHOLD = 3;
@@ -53,6 +55,61 @@ export class HttpTransport {
     }
     this.enqueueOrDispatch({ path, payload });
     return Promise.resolve();
+  }
+
+  /**
+   * One-shot POST that resolves with the parsed JSON response body. Used
+   * by `captureException` to retrieve the server-assigned event id so
+   * follow-up attachment uploads can be linked.
+   *
+   * Fail-open: returns `null` on any error (network, non-2xx, parse).
+   * Respects {@link timeoutMs} via `AbortController`. Bounded retries.
+   */
+  async sendAndRead<T = any>(
+    path: string,
+    payload: unknown,
+    options: { timeoutMs?: number; retries?: number } = {},
+  ): Promise<T | null> {
+    if (!this.enabled) return null;
+    const timeoutMs = options.timeoutMs ?? 5000;
+    const retries = Math.max(0, options.retries ?? 1);
+    let attempt = 0;
+    let lastError: unknown = null;
+    while (attempt <= retries) {
+      try {
+        const url = `${this.baseUrl}${path}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-AllStak-Key': this.apiKey,
+            },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const text = await res.text();
+          if (!text) return null;
+          try { return JSON.parse(text) as T; } catch { return null; }
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      } catch (err) {
+        lastError = err;
+        attempt += 1;
+        if (attempt > retries) break;
+        // Brief backoff between retries (best-effort).
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+      }
+    }
+    if (lastError && typeof __DEV__ !== 'undefined' && __DEV__) {
+      // eslint-disable-next-line no-console
+      console.warn('[AllStak] sendAndRead failed:', (lastError as Error)?.message);
+    }
+    return null;
   }
 
   private enqueueOrDispatch(item: Pending): void {
