@@ -22,7 +22,7 @@ import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const DIST = new URL('../dist/', import.meta.url).pathname;
-const TARGETS = ['index.mjs', 'index.js'];
+const TARGETS = ['index.mjs', 'index.js', 'metro.mjs', 'metro.js'];
 
 for (const file of TARGETS) {
   const path = join(DIST, file);

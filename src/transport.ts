@@ -112,6 +112,10 @@ export class HttpTransport {
     return null;
   }
 
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   private enqueueOrDispatch(item: Pending): void {
     if (Date.now() < this.circuitOpenUntil) {
       this.push(item);

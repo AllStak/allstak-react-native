@@ -254,7 +254,7 @@ test('Body: fields with "token" or "password" in name are redacted', () => {
   const parsed = JSON.parse(result.body);
   assert.equal(parsed.resetToken, REDACTED);
   assert.equal(parsed.oldPassword, REDACTED);
-  assert.equal(parsed.email, 'a@b.com');
+  assert.equal(parsed.email, REDACTED);
 });
 
 test('Body: api_key, secret, jwt, otp, passcode, credit_card, iban, national_id are all redacted', () => {

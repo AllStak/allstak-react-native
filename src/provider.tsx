@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { AllStak, AllStakClient } from './client';
-import type { AllStakConfig } from './client';
+import type { AllStakConfig, LogLevel, SeverityLevel } from './client';
 import { installReactNative } from './install';
 import type { ReactNativeInstallOptions } from './install';
 import { __setRootViewRef } from './screenshot';
@@ -36,6 +36,8 @@ export interface AllStakProviderProps extends ReactNativeInstallOptions {
    * capture, or `{ warn: false, error: false }` to suppress.
    */
   captureConsole?: AllStakConfig['captureConsole'];
+  enableLogs?: AllStakConfig['enableLogs'];
+  beforeSendLog?: AllStakConfig['beforeSendLog'];
   sampleRate?: number;
   beforeSend?: AllStakConfig['beforeSend'];
   replay?: AllStakConfig['replay'];
@@ -112,7 +114,7 @@ class AllStakErrorBoundary extends React.Component<
       AllStak.captureException(error, {
         componentStack: info.componentStack ?? '',
         source: 'AllStakProvider.ErrorBoundary',
-      });
+      }, { mechanism: 'errorboundary', handled: true });
       if (this.props.debug) {
         // eslint-disable-next-line no-console
         console.log(`[AllStak] Captured render error: ${error.message}`);
@@ -149,6 +151,8 @@ export function AllStakProvider({
   enableHttpTracking,
   httpTracking,
   captureConsole,
+  enableLogs,
+  beforeSendLog,
   sampleRate,
   beforeSend,
   replay,
@@ -213,6 +217,8 @@ export function AllStakProvider({
         enableHttpTracking,
         httpTracking,
         captureConsole,
+        enableLogs,
+        beforeSendLog,
         sampleRate,
         beforeSend,
         replay,
@@ -237,6 +243,10 @@ export function AllStakProvider({
       };
       clientRef.current = AllStak.init(config);
       __providerOwnedInstance = clientRef.current;
+
+      // Emit a single app-start lifecycle breadcrumb on first init.
+      try { AllStak.addBreadcrumb('default', 'app.start', 'info', { source: 'AllStakProvider' }); }
+      catch { /* never break host */ }
 
       installReactNative({
         autoErrorHandler,
@@ -269,7 +279,8 @@ export function AllStakProvider({
     };
   }, [destroyOnUnmount, debug]);
 
-  // Wrap children in a ref'd root view so view-shot can capture by ref.
+  // Wrap children in a ref'd root view so masking primitives can flip before
+  // the native screenshot module captures the current window.
   // Use collapsable={false} on Android to avoid the view being optimized
   // away by Yoga when it has no styles of its own.
   const boundary = (
@@ -300,8 +311,11 @@ export function useAllStak() {
         AllStak.captureException(error, ctx),
       captureMessage: (
         msg: string,
-        level: 'fatal' | 'error' | 'warning' | 'info' = 'info',
+        level: SeverityLevel = 'info',
       ) => AllStak.captureMessage(msg, level),
+      log: (level: LogLevel, message: string, attributes?: Record<string, unknown>) =>
+        AllStak.log(level, message, attributes),
+      logger: AllStak.logger,
       setUser: (user: { id?: string; email?: string }) => AllStak.setUser(user),
       setTag: (key: string, value: string) => AllStak.setTag(key, value),
       addBreadcrumb: (
@@ -313,6 +327,30 @@ export function useAllStak() {
     }),
     [],
   );
+}
+
+let __wrapInstalled = false;
+
+export function wrap<P extends object>(
+  Component: React.ComponentType<P>,
+): React.ComponentType<P> {
+  function AllStakWrappedComponent(props: P): React.ReactElement {
+    React.useEffect(() => {
+      if (__wrapInstalled) return;
+      __wrapInstalled = true;
+      installReactNative();
+      try { AllStak.addBreadcrumb('default', 'app.start', 'info', { source: 'AllStak.wrap' }); }
+      catch { /* never break host */ }
+    }, []);
+
+    return (
+      <AllStakErrorBoundary>
+        <Component {...props} />
+      </AllStakErrorBoundary>
+    );
+  }
+  AllStakWrappedComponent.displayName = `AllStak.wrap(${Component.displayName || Component.name || 'Component'})`;
+  return AllStakWrappedComponent;
 }
 
 /** @internal — for tests. Resets the module-level remount-guard. */

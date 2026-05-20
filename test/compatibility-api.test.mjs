@@ -1,5 +1,5 @@
 /**
- * Sentry-parity API tests for @allstak/react-native:
+ * Compatibility API tests for @allstak/react-native:
  *   beforeSend / sampleRate / setTags / setExtra(s) / setContext / flush()
  */
 import { test } from 'node:test';

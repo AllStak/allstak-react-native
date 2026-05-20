@@ -10,7 +10,7 @@
  *   - console.warn capture → log breadcrumb at level=warn
  *   - console.error capture → log breadcrumb at level=error
  *   - AppState breadcrumb when react-native is available
- *   - Platform tags (device.os / device.osVersion / device.model) in
+ *   - Platform tags (device_os / device_os_version / device_model) in
  *     event payload when react-native is available
  *   - Architecture tags (rn.architecture / rn.bridgeless / rn.hermes)
  *     present even without react-native
@@ -239,9 +239,9 @@ test('Platform.OS / Platform.Version / Model land on the event payload when auto
   AllStak.captureException(new Error('tag-check'));
   await new Promise((r) => setTimeout(r, 50));
   const body = JSON.parse(sent[0].init.body);
-  assert.equal(body.metadata['device.os'], 'ios');
-  assert.equal(body.metadata['device.osVersion'], '17.4');
-  assert.equal(body.metadata['device.model'], 'iPhone 15 Pro');
+  assert.equal(body.metadata.device_os, 'ios');
+  assert.equal(body.metadata.device_os_version, '17.4');
+  assert.equal(body.metadata.device_model, 'iPhone 15 Pro');
 });
 
 test('SDK identity is stamped: sdkName / platform / dist on every event', async () => {

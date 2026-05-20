@@ -26,6 +26,8 @@ export interface SpanData {
   spanId: string;
   parentSpanId: string;
   operation: string;
+  op?: string;
+  platform?: string;
   description: string;
   status: 'ok' | 'error' | 'timeout';
   durationMs: number;
@@ -33,8 +35,24 @@ export interface SpanData {
   endTimeMillis: number;
   service: string;
   environment: string;
+  release?: string;
+  sessionId?: string;
+  sampleRate?: number;
+  sampleWeight?: number;
   tags: Record<string, string>;
+  measurements?: Record<string, number>;
+  attributes?: Record<string, string>;
   data: string;
+}
+
+export interface SpanOptions {
+  description?: string;
+  tags?: Record<string, string>;
+  op?: string;
+  platform?: string;
+  measurements?: Record<string, number>;
+  attributes?: Record<string, string | number | boolean | null | undefined>;
+  startTimeMillis?: number;
 }
 
 function id(): string {
@@ -55,36 +73,61 @@ export class Span {
     private _spanId: string,
     private _parentSpanId: string,
     private _operation: string,
+    private _op: string,
+    private _platform: string,
     private _description: string,
     private _service: string,
     private _environment: string,
+    private _release: string | undefined,
+    private _sessionId: string | undefined,
+    private _sampleRate: number,
+    private _sampleWeight: number,
     private _tags: Record<string, string>,
+    private _measurements: Record<string, number>,
+    private _attributes: Record<string, string>,
     private _onFinish: (data: SpanData) => void,
+    startTimeMillis?: number,
   ) {
-    this._startTimeMillis = Date.now();
+    this._startTimeMillis = startTimeMillis ?? Date.now();
   }
 
   setTag(key: string, value: string): this { this._tags[key] = value; return this; }
   setData(data: string): this { this._data = data; return this; }
   setDescription(description: string): this { this._description = description; return this; }
+  setMeasurement(key: string, value: number): this {
+    if (Number.isFinite(value)) this._measurements[key] = value;
+    return this;
+  }
+  setAttribute(key: string, value: string | number | boolean | null | undefined): this {
+    if (value != null) this._attributes[key] = String(value);
+    return this;
+  }
 
-  finish(status: 'ok' | 'error' | 'timeout' = 'ok'): void {
+  finish(status: 'ok' | 'error' | 'timeout' = 'ok', endTimeMillis?: number): void {
     if (this._finished) return;
     this._finished = true;
-    const endTimeMillis = Date.now();
+    const end = endTimeMillis ?? Date.now();
     this._onFinish({
       traceId: this._traceId,
       spanId: this._spanId,
       parentSpanId: this._parentSpanId,
       operation: this._operation,
+      op: this._op,
+      platform: this._platform,
       description: this._description,
       status,
-      durationMs: endTimeMillis - this._startTimeMillis,
+      durationMs: Math.max(0, end - this._startTimeMillis),
       startTimeMillis: this._startTimeMillis,
-      endTimeMillis,
+      endTimeMillis: end,
       service: this._service,
       environment: this._environment,
+      release: this._release,
+      sessionId: this._sessionId,
+      sampleRate: this._sampleRate,
+      sampleWeight: this._sampleWeight,
       tags: this._tags,
+      measurements: this._measurements,
+      attributes: this._attributes,
       data: this._data,
     });
   }
@@ -97,7 +140,7 @@ export class Span {
 /** A no-op span returned when `tracesSampleRate` drops the trace. */
 class NoopSpan extends Span {
   constructor(traceId: string, spanId: string) {
-    super(traceId, spanId, '', '', '', '', '', {}, () => {});
+    super(traceId, spanId, '', '', '', '', '', '', '', undefined, undefined, 0, 0, {}, {}, {}, () => {});
   }
   finish(): void { /* never enqueues anything */ }
 }
@@ -105,14 +148,20 @@ class NoopSpan extends Span {
 interface TracingOptions {
   service: string;
   environment: string;
+  release?: string;
+  sessionId?: string;
+  platform?: string;
   /** 0..1 — probability to record a span. Default 1. */
   tracesSampleRate?: number;
+  beforeSendSpan?: (span: SpanData) => SpanData | null | undefined;
 }
 
 export class TracingModule {
   private spans: SpanData[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private currentTraceId: string | null = null;
+  private currentSampled: boolean | null = null;
+  private currentSampleRate = 1;
   private spanStack: Span[] = [];
   private destroyed = false;
 
@@ -123,12 +172,18 @@ export class TracingModule {
 
   /** Get (and lazily create) the active trace ID. */
   getTraceId(): string {
-    if (!this.currentTraceId) this.currentTraceId = id();
+    if (!this.currentTraceId) {
+      this.currentTraceId = id();
+      this.ensureSamplingDecision();
+    }
     return this.currentTraceId;
   }
 
   /** Override the active trace ID, e.g. from an inbound request header. */
-  setTraceId(traceId: string): void { this.currentTraceId = traceId; }
+  setTraceId(traceId: string): void {
+    this.currentTraceId = traceId;
+    this.ensureSamplingDecision();
+  }
 
   /** Get the active span's ID, or null if no span is active. */
   getCurrentSpanId(): string | null {
@@ -138,6 +193,8 @@ export class TracingModule {
   /** Reset both the trace ID and the in-flight span stack. */
   resetTrace(): void {
     this.currentTraceId = null;
+    this.currentSampled = null;
+    this.currentSampleRate = 1;
     this.spanStack = [];
   }
 
@@ -146,32 +203,45 @@ export class TracingModule {
    * span as its parent. If `tracesSampleRate` drops this trace, returns a
    * no-op Span so the call site doesn't have to null-check.
    */
-  startSpan(operation: string, options: { description?: string; tags?: Record<string, string> } = {}): Span {
+  startSpan(operation: string, options: SpanOptions = {}): Span {
     const traceId = this.getTraceId();
     const spanId = id();
     const parentSpanId = this.getCurrentSpanId() ?? '';
 
-    if (!this.passesSampleRate()) {
+    if (!this.ensureSamplingDecision()) {
       // Sampled out — return a no-op so the public API shape is stable.
       return new NoopSpan(traceId, spanId);
     }
 
+    const attributes: Record<string, string> = {};
+    for (const [key, value] of Object.entries(options.attributes ?? {})) {
+      if (value != null) attributes[key] = String(value);
+    }
     const span = new Span(
       traceId, spanId, parentSpanId,
-      operation, options.description ?? '',
+      operation, options.op ?? operation, options.platform ?? this.opts.platform ?? '',
+      options.description ?? '',
       this.opts.service ?? '', this.opts.environment ?? '',
+      this.opts.release, this.opts.sessionId,
+      this.currentSampleRate, this.currentSampleRate > 0 ? 1 / this.currentSampleRate : 0,
       { ...(options.tags ?? {}) },
+      { ...(options.measurements ?? {}) },
+      attributes,
       (data) => this.enqueue(data, span),
+      options.startTimeMillis,
     );
     this.spanStack.push(span);
     return span;
   }
 
-  private passesSampleRate(): boolean {
+  private ensureSamplingDecision(): boolean {
+    if (this.currentSampled !== null) return this.currentSampled;
     const r = this.opts.tracesSampleRate;
-    if (typeof r !== 'number' || r >= 1) return true;
-    if (r <= 0) return false;
-    return Math.random() < r;
+    this.currentSampleRate = typeof r === 'number' ? Math.max(0, Math.min(1, r)) : 1;
+    if (this.currentSampleRate >= 1) this.currentSampled = true;
+    else if (this.currentSampleRate <= 0) this.currentSampled = false;
+    else this.currentSampled = Math.random() < this.currentSampleRate;
+    return this.currentSampled;
   }
 
   private enqueue(data: SpanData, span: Span): void {
@@ -181,7 +251,10 @@ export class TracingModule {
     const idx = this.spanStack.lastIndexOf(span);
     if (idx >= 0) this.spanStack.splice(idx, 1);
 
-    this.spans.push(data);
+    const finalData = this.opts.beforeSendSpan ? this.opts.beforeSendSpan(data) : data;
+    if (!finalData) return;
+
+    this.spans.push(finalData);
     if (this.spans.length >= BATCH_SIZE_THRESHOLD) {
       this.flush();
       return;
@@ -204,6 +277,8 @@ export class TracingModule {
     if (this.flushTimer) { clearInterval(this.flushTimer); this.flushTimer = null; }
     this.flush();
     this.currentTraceId = null;
+    this.currentSampled = null;
+    this.currentSampleRate = 1;
     this.spanStack = [];
   }
 }

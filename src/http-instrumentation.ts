@@ -8,8 +8,8 @@
  *
  * Privacy + safety contract:
  *   - URL query params are sanitized via `redactUrl` BEFORE being recorded
- *   - Headers are not recorded unless `captureHeaders: true`
- *   - Bodies are not recorded unless `captureRequestBody`/`captureResponseBody`
+ *   - Headers are recorded by default with hard-redacted sensitive names
+ *   - Bodies are recorded by default with sensitive fields masked
  *   - Response body capture clones the Response (or skips when cloning is
  *     unsafe — large/streaming responses) so the consumer's downstream
  *     `.json()` / `.text()` still works without "body already used" errors
@@ -35,6 +35,8 @@ const XHR_FLAG = '__allstak_http_xhr_patched__';
 const AXIOS_FLAG = Symbol.for('allstak.http.axios.instrumented');
 
 const DEFAULT_MAX_BODY = 4096;
+
+const BODY_UNAVAILABLE_REASON = 'HTTP body capture is enabled, but this React Native runtime did not expose a readable response body.';
 
 // Module-level "current binding" — wrappers route capture calls through
 // this so re-init swaps the underlying module without re-wrapping the
@@ -64,6 +66,8 @@ interface RuntimeBinding {
   dist?: string;
   platform?: string;
   environment?: string;
+  sessionId?: string;
+  tracePropagationTargets?: (string | RegExp)[];
 }
 
 interface RequestContext {
@@ -77,14 +81,14 @@ interface RequestContext {
 
 function bind(opts: HttpTrackingOptions, ownIngestHost: string): BoundOptions {
   return {
-    captureRequestBody: opts.captureRequestBody ?? false,
-    captureResponseBody: opts.captureResponseBody ?? false,
-    captureHeaders: opts.captureHeaders ?? false,
+    captureRequestBody: opts.captureRequestBody ?? true,
+    captureResponseBody: opts.captureResponseBody ?? true,
+    captureHeaders: opts.captureHeaders ?? true,
     redactHeaders: opts.redactHeaders ?? [],
     redactQueryParams: opts.redactQueryParams ?? [],
     ignoredUrls: opts.ignoredUrls ?? [],
     allowedUrls: opts.allowedUrls ?? [],
-    maxBodyBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY,
+    maxBodyBytes: opts.maxBodyBytes ?? 8192,
     allowedContentTypes: opts.allowedContentTypes ?? ['application/json', 'text/', 'application/problem+json'],
     redactBodyFields: opts.redactBodyFields ?? [],
     ownIngestPrefix: ownIngestHost.replace(/\/$/, ''),
@@ -149,14 +153,27 @@ function normalizeSpanId(spanId: string): string {
   return (hex + '0000000000000000').slice(0, 16);
 }
 
+function targetMatches(url: string, targets?: (string | RegExp)[]): boolean {
+  if (!targets || targets.length === 0) return true;
+  return targets.some((target) => typeof target === 'string' ? url.includes(target) : target.test(url));
+}
+
 function createRequestContext(method: string, url: string): RequestContext | null {
   const runtime = currentRuntime();
-  if (!runtime) return null;
+  if (!runtime || !targetMatches(url, runtime.tracePropagationTargets)) return null;
   const requestId = generateHttpId();
   const parentSpanId = runtime.tracing.getCurrentSpanId() ?? '';
   const span = runtime.tracing.startSpan('mobile.http', {
+    op: 'http.client',
+    platform: runtime.platform ?? 'react-native',
     description: `${method.toUpperCase()} ${url}`,
     tags: { requestId, method: method.toUpperCase(), platform: runtime.platform ?? 'react-native' },
+    attributes: {
+      'http.method': method.toUpperCase(),
+      'http.url': url,
+      request_id: requestId,
+      session_id: runtime.sessionId,
+    },
   });
   const traceId = runtime.tracing.getTraceId();
   const spanId = span.spanId;
@@ -171,8 +188,15 @@ function createRequestContext(method: string, url: string): RequestContext | nul
 }
 
 function propagationHeaders(ctx: RequestContext): Record<string, string> {
+  const baggage = [
+    `allstak-trace_id=${encodeURIComponent(ctx.traceId)}`,
+    `allstak-span_id=${encodeURIComponent(ctx.spanId)}`,
+    `allstak-request_id=${encodeURIComponent(ctx.requestId)}`,
+  ].join(',');
   const headers: Record<string, string> = {
     traceparent: ctx.traceparent,
+    'allstak-trace': `${ctx.traceId}-${ctx.spanId}-1`,
+    'allstak-baggage': baggage,
     'x-allstak-trace-id': ctx.traceId,
     'x-allstak-request-id': ctx.requestId,
   };
@@ -275,7 +299,7 @@ export function patchFetch(): void {
     }
 
     const durationMs = Date.now() - start;
-    let respBody: string | undefined;
+    let respBodyResult: ReturnType<typeof captureBodyResult> | null = null;
     let respSize: number | undefined;
     let respHeaders: Record<string, string> | undefined;
     try {
@@ -287,12 +311,26 @@ export function patchFetch(): void {
         try {
           const cloned = response.clone();
           const text = await cloned.text();
-          respBody = captureBodyResult(text, true, opts.maxBodyBytes, opts, respHeaders?.['content-type']).body;
+          respBodyResult = captureBodyResult(text, true, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
           if (respSize == null) respSize = safeByteLength(text);
-        } catch { /* clone unsafe — leave body undefined */ }
+        } catch {
+          respBodyResult = unavailableBodyResult('response_clone_failed');
+        }
+      } else if (opts.captureResponseBody) {
+        respBodyResult = unavailableBodyResult('response_clone_unavailable');
+      } else {
+        respBodyResult = captureBodyResult(undefined, false, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
       }
-    } catch { /* never break the response surface */ }
-    const respBodyResult = captureBodyResult(respBody, opts.captureResponseBody && respBody !== undefined, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
+    } catch {
+      respBodyResult = opts.captureResponseBody
+        ? unavailableBodyResult('response_body_unavailable')
+        : captureBodyResult(undefined, false, opts.maxBodyBytes, opts, respHeaders?.['content-type']);
+    }
+    respBodyResult = respBodyResult ?? (
+      opts.captureResponseBody
+        ? unavailableBodyResult('response_body_unavailable')
+        : captureBodyResult(undefined, false, opts.maxBodyBytes, opts, respHeaders?.['content-type'])
+    );
     const isError = response.status >= 400;
     ctx?.span.setTag('requestId', ctx.requestId).setTag('http.status_code', String(response.status)).finish(isError ? 'error' : 'ok');
     if (ctx) recordTimeline(isError ? 'exception' : 'response', isError ? 'request_failed' : 'response_received', ctx, { statusCode: response.status, durationMs });
@@ -309,6 +347,7 @@ export function patchFetch(): void {
       responseBody: respBodyResult.body, responseHeaders: respHeaders, responseSize: respSize,
       requestBodyStatus: reqBody.status,
       responseBodyStatus: respBodyResult.status,
+      responseBodyCaptureReason: respBodyResult.status === 'unsupported' ? BODY_UNAVAILABLE_REASON : undefined,
       requestBodyRedactedFields: reqBody.redactedFields,
       responseBodyRedactedFields: respBodyResult.redactedFields,
       requestBodyTruncated: reqBody.truncated,
@@ -378,6 +417,9 @@ export function patchXhr(): void {
       let respHeaders: Record<string, string> | undefined;
       let respBody: string | undefined;
       let respSize: number | undefined;
+      let respBodyResult = opts.captureResponseBody
+        ? unavailableBodyResult('xhr_response_body_unavailable')
+        : captureBodyResult(undefined, false, opts.maxBodyBytes, opts);
       try {
         const liveOpts = currentOpts() ?? opts;
         if (liveOpts.captureHeaders && typeof (this as any).getAllResponseHeaders === 'function') {
@@ -389,7 +431,6 @@ export function patchXhr(): void {
           }
           respHeaders = sanitizeHeaders(dict, liveOpts);
         }
-        let respBodyResult = captureBodyResult(undefined, false, liveOpts.maxBodyBytes, liveOpts);
         if (liveOpts.captureResponseBody) {
           const text = (this as any).responseText;
           if (typeof text === 'string') {
@@ -414,10 +455,13 @@ export function patchXhr(): void {
         requestBody: reqBody.body, requestHeaders: reqHeaders, requestSize: reqSize,
         responseBody: respBody, responseHeaders: respHeaders, responseSize: respSize,
         requestBodyStatus: reqBody.status,
-        responseBodyStatus: respBody ? 'captured' : opts.captureResponseBody ? 'empty' : 'disabled',
+        responseBodyStatus: respBodyResult.status,
+        responseBodyCaptureReason: respBodyResult.status === 'unsupported' ? BODY_UNAVAILABLE_REASON : undefined,
         requestBodyRedactedFields: reqBody.redactedFields,
+        responseBodyRedactedFields: respBodyResult.redactedFields,
         requestBodyTruncated: reqBody.truncated,
-        capturePolicy: reqBody.capturePolicy,
+        responseBodyTruncated: respBodyResult.truncated,
+        capturePolicy: `${reqBody.capturePolicy};${respBodyResult.capturePolicy}`,
         error,
         linkConfidence: 'exact',
       });
@@ -431,6 +475,15 @@ export function patchXhr(): void {
   };
 
   X.prototype[XHR_FLAG] = true;
+}
+
+function unavailableBodyResult(policy: string): ReturnType<typeof captureBodyResult> {
+  return {
+    status: 'unsupported',
+    redactedFields: [],
+    truncated: false,
+    capturePolicy: policy,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────

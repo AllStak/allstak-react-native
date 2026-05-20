@@ -1,8 +1,8 @@
 /**
  * Runtime detection for React Native screenshot capture.
  *
- * Determines whether native screenshot APIs (specifically
- * `react-native-view-shot`) are usable in the current host:
+ * Determines whether SDK-owned native screenshot APIs are usable in the
+ * current host:
  *   - 'expo-go'        — Expo Go sandbox; native modules cannot be added
  *                        at runtime → screenshots silently skipped.
  *   - 'expo-dev-client'— Expo dev/prod build that bundles native deps.
@@ -63,7 +63,7 @@ function computeRuntimeMode(): RuntimeMode {
   return 'unknown';
 }
 
-/** Whether a runtime allows attempting a native screenshot via view-shot. */
+/** Whether a runtime allows attempting a native screenshot. */
 export function runtimeAllowsScreenshot(mode: RuntimeMode = detectRuntimeMode()): boolean {
   if (mode === 'expo-go') return false;
   return true;

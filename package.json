@@ -1,6 +1,6 @@
 {
   "name": "@allstak/react-native",
-  "version": "0.5.0",
+  "version": "0.5.9",
   "description": "AllStak React Native SDK — standalone error tracking, breadcrumbs, network capture, and ErrorUtils + Hermes rejection hooks. No browser or Node dependencies. Native Android/iOS crash modules in ./native.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -16,6 +16,12 @@
       "import": "./dist/build/sourcemaps.mjs",
       "require": "./dist/build/sourcemaps.js"
     },
+    "./metro": {
+      "types": "./dist/metro.d.ts",
+      "import": "./dist/metro.mjs",
+      "require": "./dist/metro.js"
+    },
+    "./expo": "./app.plugin.js",
     "./app.plugin": "./app.plugin.js",
     "./app.plugin.js": "./app.plugin.js",
     "./package.json": "./package.json"
@@ -53,23 +59,19 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "build": "tsup src/index.ts src/expo-plugin.ts --format esm,cjs --dts --clean --sourcemap --platform neutral --no-shims --external react --external react-native --external @react-navigation/native --external promise/setimmediate/rejection-tracking && tsup src/build/sourcemaps.ts --format esm,cjs --dts --sourcemap --platform node --out-dir dist/build && node scripts/post-build.mjs",
+    "build": "tsup src/index.ts src/expo-plugin.ts src/metro.ts --format esm,cjs --dts --clean --sourcemap --platform neutral --no-shims --external react --external react-native --external @react-navigation/native --external promise/setimmediate/rejection-tracking --external expo/metro-config && tsup src/build/sourcemaps.ts --format esm,cjs --dts --sourcemap --platform node --out-dir dist/build && node scripts/post-build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "peerDependencies": {
     "react": ">=16.8.0",
-    "react-native": ">=0.70",
-    "react-native-view-shot": ">=3.0.0"
+    "react-native": ">=0.70"
   },
   "peerDependenciesMeta": {
     "react": {
       "optional": false
     },
     "react-native": {
-      "optional": true
-    },
-    "react-native-view-shot": {
       "optional": true
     }
   },

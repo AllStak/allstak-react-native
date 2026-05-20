@@ -44,9 +44,20 @@ export const ALWAYS_REDACT_QUERY = new Set([
 export const REDACTED = '[REDACTED]';
 
 export const DEFAULT_REDACT_BODY_FIELDS = [
+  'phone',
+  'phone_number',
+  'phonenumber',
+  'mobile',
+  'email',
+  'national_id',
+  'nationalid',
+  'id_number',
+  'idnumber',
   'password',
   'passcode',
   'otp',
+  'otp_code',
+  'otpcode',
   'token',
   'authorization',
   'cookie',
@@ -55,20 +66,22 @@ export const DEFAULT_REDACT_BODY_FIELDS = [
   'access_token',
   'jwt',
   'card',
+  'card_number',
+  'cardnumber',
   'credit_card',
+  'cvv',
   'iban',
-  'national_id',
   'secret',
   'api_key',
 ];
 
 export interface HttpTrackingOptions {
-  /** Capture request body. Default false. Truncated to maxBodyBytes. */
+  /** Capture request body. Default true. Truncated to maxBodyBytes. */
   captureRequestBody?: boolean;
-  /** Capture response body. Default false. Truncated to maxBodyBytes. */
+  /** Capture response body. Default true. Truncated to maxBodyBytes. */
   captureResponseBody?: boolean;
   /**
-   * Capture request + response headers. Default false. Hard-redacted
+   * Capture request + response headers. Default true. Hard-redacted
    * names are always stripped regardless of this flag.
    */
   captureHeaders?: boolean;
@@ -223,8 +236,9 @@ export function captureBodyResult(
       capturePolicy: 'empty_body',
     };
   }
-  const allowed = opts.allowedContentTypes ?? ['application/json', 'text/', 'application/problem+json'];
-  if (contentType && !allowed.some((needle) => contentType.toLowerCase().includes(needle.toLowerCase()))) {
+  const contentTypeLower = contentType?.toLowerCase();
+  const allowed = opts.allowedContentTypes ?? ['application/json', '+json', 'text/', 'application/problem+json'];
+  if (contentTypeLower && !allowed.some((needle) => contentTypeLower.includes(needle.toLowerCase()))) {
     return {
       status: 'unsupported',
       redactedFields: [],
@@ -290,7 +304,7 @@ export function captureBodyResult(
     status: truncated ? 'truncated' : redactedFields.length > 0 ? 'redacted' : 'captured',
     redactedFields: Array.from(new Set(redactedFields)).sort(),
     truncated,
-    capturePolicy: 'opt_in_body_capture',
+    capturePolicy: 'automatic_body_capture',
   };
 }
 

@@ -83,6 +83,26 @@ export function instrumentReactNavigation(
       AllStak.addBreadcrumb('navigation', `${last ?? '<start>'} -> ${next}`, 'info',
         { from: last, to: next, params: safe });
     } catch { /* never break host */ }
+    try {
+      const cfg = AllStak.getConfig?.();
+      const performanceEnabled = cfg?.enablePerformance === true ||
+        (cfg?.enablePerformance !== false && typeof cfg?.tracesSampleRate === 'number');
+      if (performanceEnabled) {
+        const span = AllStak.startSpan('navigation', {
+          op: 'navigation',
+          platform: 'react-native',
+          description: next,
+          tags: { from: last ?? '<start>', to: next },
+          attributes: { screen: next, previous_screen: last, ...safe },
+        });
+        span.finish('ok');
+      }
+    } catch { /* never break host */ }
+
+    // Update the current screen / transaction so subsequent events carry it.
+    // Use the silent setter so we don't double-emit a navigation breadcrumb
+    // (the addBreadcrumb call above already produced the visible one).
+    try { (AllStak as any).__setTransactionSilent?.(next); } catch { /* ignore */ }
 
     if (forwardToReplay) {
       try {

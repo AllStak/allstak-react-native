@@ -39,7 +39,8 @@ test('init without apiKey fails open and disables transport', async () => {
 
 test('init + captureException posts to /ingest/v1/errors with X-AllStak-Key', async () => {
   AllStak.init({ apiKey: 'ask_test_key', environment: 'test', release: 'mobile@1.0.0' });
-  AllStak.captureException(new Error('boom'));
+  const eventId = AllStak.captureException(new Error('boom'));
+  assert.match(eventId, /^[0-9a-f-]{36}$/);
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(sent.length, 1);
   assert.match(sent[0].url, /\/ingest\/v1\/errors$/);
@@ -81,15 +82,67 @@ test('setUser / setTag / setIdentity flow through wire payload', async () => {
   assert.equal(body.metadata['feature'], 'login');
 });
 
-test('captureMessage routes info → logs and error → both', async () => {
+test('captureMessage creates message events by default', async () => {
   sent.length = 0;
-  AllStak.captureMessage('hello info', 'info');
-  AllStak.captureMessage('boom error', 'error');
+  const infoId = AllStak.captureMessage('hello info', 'info');
+  const errorId = AllStak.captureMessage('boom error', 'error');
+  assert.match(infoId, /^[0-9a-f-]{36}$/);
+  assert.match(errorId, /^[0-9a-f-]{36}$/);
   await new Promise((r) => setTimeout(r, 10));
   const paths = sent.map((s) => new URL(s.url).pathname);
-  // info → logs only (1); error → logs + errors (2). Total 3.
+  assert.equal(paths.filter((p) => p === '/ingest/v1/logs').length, 0);
+  assert.equal(paths.filter((p) => p === '/ingest/v1/errors').length, 2);
+  const bodies = sent.map((s) => JSON.parse(s.init.body));
+  assert.deepEqual(bodies.map((b) => b.exceptionClass), ['Message', 'Message']);
+  assert.deepEqual(bodies.map((b) => b.level), ['info', 'error']);
+});
+
+test('structured logger posts to /ingest/v1/logs with attributes', async () => {
+  sent.length = 0;
+  AllStak.init({ apiKey: 'ask_test_key', environment: 'test', release: 'mobile@1.0.0', enableLogs: true });
+  AllStak.log('warn', 'hello log', { feature: 'checkout' });
+  AllStak.logger.info('info log', { step: 2 });
+  await new Promise((r) => setTimeout(r, 10));
+  const paths = sent.map((s) => new URL(s.url).pathname);
   assert.equal(paths.filter((p) => p === '/ingest/v1/logs').length, 2);
-  assert.equal(paths.filter((p) => p === '/ingest/v1/errors').length, 1);
+  assert.equal(paths.filter((p) => p === '/ingest/v1/errors').length, 0);
+  const bodies = sent.map((s) => JSON.parse(s.init.body));
+  assert.deepEqual(bodies.map((b) => b.level), ['warn', 'info']);
+  assert.equal(bodies[0].metadata.feature, 'checkout');
+  assert.equal(bodies[1].metadata.step, 2);
+});
+
+test('structured logs are gated and filterable', async () => {
+  sent.length = 0;
+  AllStak.init({ apiKey: 'ask_test_key', enableLogs: false });
+  AllStak.logger.info('disabled');
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 0);
+
+  AllStak.init({
+    apiKey: 'ask_test_key',
+    enableLogs: true,
+    beforeSendLog: (log) => log.level === 'info'
+      ? null
+      : { ...log, message: `[log] ${log.message}`, attributes: { ...log.attributes, filtered: true } },
+  });
+  AllStak.logger.info('drop');
+  AllStak.logger.error('keep');
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 1);
+  const body = JSON.parse(sent[0].init.body);
+  assert.equal(body.message, '[log] keep');
+  assert.equal(body.metadata.filtered, true);
+});
+
+test('captureMessage supports debug and log severities', async () => {
+  sent.length = 0;
+  AllStak.captureMessage('debug msg', 'debug');
+  AllStak.captureMessage('log msg', 'log');
+  await new Promise((r) => setTimeout(r, 10));
+  const bodies = sent.map((s) => JSON.parse(s.init.body));
+  assert.deepEqual(bodies.map((b) => b.level), ['debug', 'log']);
+  assert.ok(sent.every((s) => new URL(s.url).pathname === '/ingest/v1/errors'));
 });
 
 test('source code contains no banned browser APIs', async () => {

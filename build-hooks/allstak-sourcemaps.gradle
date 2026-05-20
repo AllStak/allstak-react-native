@@ -9,17 +9,17 @@
 //
 //   apply from: file('../node_modules/@allstak/react-native/build-hooks/allstak-sourcemaps.gradle')
 //
-// Set these in ~/.gradle/gradle.properties or as `-PallstakRelease=…`
-// on the command line:
+// Optional overrides in ~/.gradle/gradle.properties or CLI:
 //
-//   allstakRelease=mobile@1.2.3+5
-//   allstakUploadToken=aspk_...        # only required for actual upload
+//   allstakRelease=com.company.app@1.2.3+5
+//   allstakUploadToken=...             # build-only source-map upload credential
 //   allstakHost=https://api.allstak.sa # optional override
 //
 // What it does:
 //   • Hooks every variant whose name ends with "Release" (e.g.
 //     bundleRelease, assembleRelease) and runs the AllStak uploader
 //     on the Metro bundle + sourcemap that variant produced.
+//   • Uses the build-only upload token already written by the wizard when present.
 //   • Falls back to inject-only mode when no upload token is set.
 //   • Never fails the build over a sourcemap glitch — logs and moves on.
 //
@@ -30,6 +30,12 @@
 import org.gradle.api.tasks.Exec
 import java.nio.file.Files
 import java.nio.file.Paths
+
+def allstakProperties = new Properties()
+def allstakPropertiesFile = project.rootProject.file("allstak.properties")
+if (allstakPropertiesFile.exists()) {
+    allstakPropertiesFile.withInputStream { stream -> allstakProperties.load(stream) }
+}
 
 afterEvaluate {
     android.applicationVariants.all { variant ->
@@ -78,10 +84,20 @@ afterEvaluate {
                     return
                 }
 
+                def androidExt = project.extensions.findByName('android')
+                def defaultConfig = androidExt?.defaultConfig
+                def appId = defaultConfig?.applicationId?.toString()
+                def versionName = defaultConfig?.versionName?.toString()
+                def versionCode = defaultConfig?.versionCode?.toString()
+                def autoRelease = (appId && versionName)
+                    ? "${appId}@${versionName}${versionCode ? '+' + versionCode : ''}"
+                    : null
                 def releaseProp = project.findProperty('allstakRelease') ?:
-                    System.getenv('ALLSTAK_RELEASE')
+                    System.getenv('ALLSTAK_RELEASE') ?:
+                    autoRelease
                 def tokenProp = project.findProperty('allstakUploadToken') ?:
-                    System.getenv('ALLSTAK_UPLOAD_TOKEN')
+                    System.getenv('ALLSTAK_UPLOAD_TOKEN') ?:
+                    allstakProperties.getProperty('auth.token')
                 def hostProp = project.findProperty('allstakHost') ?:
                     System.getenv('ALLSTAK_HOST')
                 def distProp = project.findProperty('allstakDist') ?:
@@ -89,7 +105,7 @@ afterEvaluate {
                     'android-hermes'
 
                 if (releaseProp == null) {
-                    project.logger.warn("[allstak] no allstakRelease / ALLSTAK_RELEASE set — skipping sourcemap step")
+                    project.logger.warn("[allstak] could not derive release from applicationId/versionName and no allstakRelease / ALLSTAK_RELEASE was set — skipping sourcemap step")
                     enabled = false
                     return
                 }

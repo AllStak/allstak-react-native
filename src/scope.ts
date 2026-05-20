@@ -15,7 +15,7 @@
  * being processed concurrently.
  */
 
-export type Severity = 'fatal' | 'error' | 'warning' | 'info' | 'debug';
+export type Severity = 'fatal' | 'error' | 'warning' | 'log' | 'info' | 'debug';
 
 export class Scope {
   user?: { id?: string; email?: string };

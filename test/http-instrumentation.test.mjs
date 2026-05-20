@@ -2,10 +2,10 @@
  * Auto HTTP instrumentation tests for @allstak/react-native.
  *
  * Covers every case from the brief:
- *   1. fetch success                                        — body+headers default OFF
+ *   1. fetch success                                        — body+headers default ON
  *   2. fetch failure (network throw)                        — captures error string + rethrows
- *   3. fetch POST with body capture OFF (default)           — no body in payload
- *   4. fetch POST with body capture ON                      — body present, headers redacted
+ *   3. fetch POST                                           — body present by default
+ *   4. fetch POST with maxBodyBytes                         — body present, headers redacted
  *   5. URL query-param redaction (default + custom)         — token/password/api_key always redacted
  *   6. header redaction (Authorization + Cookie always)     — even with captureHeaders ON
  *   7. XHR success                                          — wraps open/send, fires load
@@ -60,6 +60,7 @@ const errPath = (s) => /\/ingest\/v1\/errors$/.test(s.url);
 const allHttpEvents = () => sent
   .filter(httpPath)
   .flatMap((s) => JSON.parse(s.init.body).requests);
+const parseHeaderJson = (headers) => headers ? JSON.parse(headers) : {};
 const allSpanEvents = () => sent
   .filter((s) => /\/ingest\/v1\/spans$/.test(s.url))
   .flatMap((s) => JSON.parse(s.init.body).spans);
@@ -79,7 +80,7 @@ const headerValue = (headers, name) => {
 
 // ───────────────────────────────────────────────────────────────
 
-test('1. fetch success — captures method/url/status/duration; body+headers OFF by default', async () => {
+test('1. fetch success — captures method/url/status/duration; body+headers ON by default', async () => {
   sent.length = 0;
   externalRequests.length = 0;
   AllStak.init({ apiKey: 'k', release: 'r', enableHttpTracking: true });
@@ -93,13 +94,32 @@ test('1. fetch success — captures method/url/status/duration; body+headers OFF
   assert.equal(e.url, 'https://api.example.com/users');
   assert.equal(e.statusCode, 200);
   assert.ok(typeof e.durationMs === 'number');
-  assert.equal(e.requestBody, undefined, 'body OFF by default');
-  assert.equal(e.responseBody, undefined, 'body OFF by default');
-  assert.equal(e.requestHeaders, undefined, 'headers OFF by default');
+  assert.equal(e.requestBody, undefined, 'GET has no request body');
+  assert.equal(e.responseBody, 'ok');
+  assert.ok(e.responseHeaders, 'headers captured by default');
   const outbound = externalRequests.find((r) => r.url.includes('/users'));
   assert.ok(headerValue(outbound.init.headers, 'traceparent'), 'fetch must inject traceparent');
   assert.equal(headerValue(outbound.init.headers, 'x-allstak-trace-id'), e.traceId);
   assert.equal(headerValue(outbound.init.headers, 'x-allstak-request-id'), e.requestId);
+});
+
+test('1b. fetch tracking is automatic after init unless explicitly disabled', async () => {
+  sent.length = 0;
+  externalRequests.length = 0;
+  AllStak.init({ apiKey: 'k', release: 'r' });
+  await fetch('https://api.example.com/automatic');
+  AllStak.destroy();
+  await wait(20);
+  const automatic = allHttpEvents().find((e) => e.url === 'https://api.example.com/automatic');
+  assert.ok(automatic, 'HTTP request event must be recorded without enableHttpTracking');
+
+  sent.length = 0;
+  externalRequests.length = 0;
+  AllStak.init({ apiKey: 'k', release: 'r', enableHttpTracking: false });
+  await fetch('https://api.example.com/disabled');
+  AllStak.destroy();
+  await wait(20);
+  assert.equal(allHttpEvents().length, 0, 'enableHttpTracking=false must remain a kill switch');
 });
 
 test('2. fetch failure — records error string and re-throws', async () => {
@@ -117,7 +137,7 @@ test('2. fetch failure — records error string and re-throws', async () => {
   assert.match(failed.error, /network/);
 });
 
-test('3. fetch POST with body capture OFF — body not present', async () => {
+test('3. fetch POST captures request body automatically', async () => {
   sent.length = 0;
   AllStak.init({ apiKey: 'k', enableHttpTracking: true });
   await fetch('https://api.example.com/items', {
@@ -127,7 +147,7 @@ test('3. fetch POST with body capture OFF — body not present', async () => {
   AllStak.destroy();
   await wait(20);
   const e = allHttpEvents().find((x) => x.method === 'POST');
-  assert.equal(e.requestBody, undefined);
+  assert.equal(e.requestBody, JSON.stringify({ price: 10 }));
 });
 
 test('4. fetch POST with body capture ON — body present + truncated to maxBodyBytes', async () => {
@@ -146,8 +166,8 @@ test('4. fetch POST with body capture ON — body present + truncated to maxBody
   assert.ok(e.requestBody.length <= 16 + '…[truncated]'.length, 'body must be truncated');
   assert.match(e.requestBody, /…\[truncated\]$/);
   assert.match(e.responseBody, /…\[truncated\]$/);
-  assert.equal(e.requestBodyStatus, 'truncated');
-  assert.equal(e.responseBodyStatus, 'truncated');
+  assert.equal(e.requestBodyCaptureStatus, 'truncated');
+  assert.equal(e.responseBodyCaptureStatus, 'truncated');
   assert.equal(e.requestBodyTruncated, true);
   nextResponseBody = 'ok';
 });
@@ -182,8 +202,8 @@ test('4b. recursive JSON body redaction masks sensitive fields and reports metad
   assert.ok(!JSON.stringify(e).includes('4111111111111111'));
   assert.deepEqual(e.requestBodyRedactedFields, ['nested.card', 'nested.otp', 'password']);
   assert.deepEqual(e.responseBodyRedactedFields, ['token']);
-  assert.equal(e.requestBodyStatus, 'redacted');
-  assert.equal(e.responseBodyStatus, 'redacted');
+  assert.equal(e.requestBodyCaptureStatus, 'redacted');
+  assert.equal(e.responseBodyCaptureStatus, 'redacted');
   nextResponseBody = 'ok';
 });
 
@@ -224,10 +244,11 @@ test('6. header redaction — Authorization + Cookie ALWAYS stripped', async () 
   AllStak.destroy();
   await wait(20);
   const e = allHttpEvents().find((x) => x.path === '/secure');
-  assert.equal(e.requestHeaders.authorization, '[REDACTED]');
-  assert.equal(e.requestHeaders.cookie, '[REDACTED]');
-  assert.equal(e.requestHeaders['x-api-key'], '[REDACTED]');
-  assert.equal(e.requestHeaders['x-request-id'], 'req-42', 'non-sensitive headers survive');
+  const requestHeaders = parseHeaderJson(e.requestHeaders);
+  assert.equal(requestHeaders.authorization, '[REDACTED]');
+  assert.equal(requestHeaders.cookie, '[REDACTED]');
+  assert.equal(requestHeaders['x-api-key'], '[REDACTED]');
+  assert.equal(requestHeaders['x-request-id'], 'req-42', 'non-sensitive headers survive');
   // Final guarantee: payload contains no raw secret strings.
   const json = JSON.stringify(allHttpEvents());
   assert.ok(!json.includes('secret-token-xyz'));
@@ -406,6 +427,8 @@ test('12. response clone safety — body capture skipped when clone unavailable'
   const e = allHttpEvents().find((x) => x.path === '/no-clone');
   assert.ok(e, 'event still recorded even when body cannot be cloned');
   assert.equal(e.responseBody, undefined, 'body skipped silently when clone is unsafe');
+  assert.equal(e.responseBodyCaptureStatus, 'unsupported');
+  assert.match(e.responseBodyCaptureReason, /enabled.*runtime/i);
 });
 
 test('13. recent failed request attached to next captureException', async () => {

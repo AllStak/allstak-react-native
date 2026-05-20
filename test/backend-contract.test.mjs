@@ -5,8 +5,9 @@
  * payload shape is accepted (HTTP 2xx) for every public capture path:
  *
  *   - captureException (error event)
- *   - captureMessage info → /ingest/v1/logs
- *   - captureMessage error → /ingest/v1/errors + /ingest/v1/logs
+ *   - captureMessage info → /ingest/v1/errors
+ *   - logger info → /ingest/v1/logs
+ *   - captureMessage error → /ingest/v1/errors
  *   - native crash drain (drainPendingNativeCrashes simulating relaunch)
  *   - retry behavior under transient failure
  *   - 4xx auth failure does not crash the SDK
@@ -99,8 +100,8 @@ test('captureException posts a payload accepted by the live backend', async (t) 
   });
 
   AllStak.captureException(new Error('contract: render error'), {
-    'device.os': 'ios',
-    'device.osVersion': '17.4',
+    device_os: 'ios',
+    device_os_version: '17.4',
     'rn.architecture': 'new-arch',
   });
   await new Promise((r) => setTimeout(r, 200));
@@ -117,40 +118,61 @@ test('captureException posts a payload accepted by the live backend', async (t) 
   assert.equal(body.environment, 'test-contract');
   assert.equal(body.release, 'rn-contract@1.0.0');
   assert.equal(body.dist, 'ios-hermes');
-  assert.equal(body.metadata['device.os'], 'ios');
+  assert.equal(body.metadata.device_os, 'ios');
 });
 
-// ── 2. captureMessage('info') → /ingest/v1/logs accepted ────────
+// ── 2. captureMessage('info') → /ingest/v1/errors accepted ──────
 
-test('captureMessage info posts to /ingest/v1/logs and is accepted', async (t) => {
+test('captureMessage info posts to /ingest/v1/errors and is accepted', async (t) => {
   if (!ensureBackendOrSkip(t)) return;
   AllStak.init({ apiKey: API_KEY, host: BACKEND, release: 'rn-contract@1.0.0' });
 
-  AllStak.captureMessage('contract: info log', 'info');
+  AllStak.captureMessage('contract: info message', 'info');
+  await new Promise((r) => setTimeout(r, 200));
+
+  const errReq = observed.find((o) => o.url.endsWith('/ingest/v1/errors'));
+  assert.ok(errReq, 'message event call must have been made');
+  const body = JSON.parse(errReq.init.body);
+  assert.equal(body.exceptionClass, 'Message');
+  assert.equal(body.message, 'contract: info message');
+  assert.equal(body.level, 'info');
+});
+
+// ── 3. logger.info → /ingest/v1/logs accepted ───────────────────
+
+test('logger info posts to /ingest/v1/logs and is accepted', async (t) => {
+  if (!ensureBackendOrSkip(t)) return;
+  AllStak.init({ apiKey: API_KEY, host: BACKEND, release: 'rn-contract@1.0.0', enableLogs: true });
+
+  AllStak.logger.info('contract: info log', { source: 'contract' });
   await new Promise((r) => setTimeout(r, 200));
 
   const logReq = observed.find((o) => o.url.endsWith('/ingest/v1/logs'));
   assert.ok(logReq, 'log call must have been made');
+  const body = JSON.parse(logReq.init.body);
+  assert.equal(body.level, 'info');
+  assert.equal(body.message, 'contract: info log');
+  assert.equal(body.metadata.source, 'contract');
 });
 
-// ── 3. captureMessage('error') → both /errors and /logs ─────────
+// ── 4. captureMessage('error') → /ingest/v1/errors accepted ─────
 
-test('captureMessage error posts to both /ingest/v1/errors and /ingest/v1/logs', async (t) => {
+test('captureMessage error posts to /ingest/v1/errors and is accepted', async (t) => {
   if (!ensureBackendOrSkip(t)) return;
   AllStak.init({ apiKey: API_KEY, host: BACKEND, release: 'rn-contract@1.0.0' });
 
-  AllStak.captureMessage('contract: error log', 'error');
+  AllStak.captureMessage('contract: error message', 'error');
   await new Promise((r) => setTimeout(r, 250));
 
-  const logReq = observed.find((o) => o.url.endsWith('/ingest/v1/logs'));
   const errReq = observed.find((o) => o.url.endsWith('/ingest/v1/errors'));
-  assert.ok(logReq, 'log call must have been made');
   assert.ok(errReq, 'error call must have been made');
   const eb = JSON.parse(errReq.init.body);
   assert.equal(eb.exceptionClass, 'Message');
+  assert.equal(eb.message, 'contract: error message');
+  assert.equal(eb.level, 'error');
 });
 
-// ── 4. drainPendingNativeCrashes → /ingest/v1/errors with native.crash=true ─
+// ── 5. drainPendingNativeCrashes → /ingest/v1/errors with native.crash=true ─
 
 test('drainPendingNativeCrashes routes the stashed payload to /ingest/v1/errors', async (t) => {
   if (!ensureBackendOrSkip(t)) return;
@@ -162,7 +184,7 @@ test('drainPendingNativeCrashes routes the stashed payload to /ingest/v1/errors'
       exceptionClass: 'NSException',
       message: 'NSInvalidArgumentException: contract test',
       stackTrace: ['0  CoreFoundation 0x1a2b3c0 __exceptionPreprocess'],
-      metadata: { thread: 'main', 'device.os': 'ios' },
+      metadata: { thread: 'main', device_os: 'ios' },
     }),
   });
 
@@ -178,7 +200,7 @@ test('drainPendingNativeCrashes routes the stashed payload to /ingest/v1/errors'
   assert.equal(body.platform, 'react-native');
 });
 
-// ── 5. retry behavior — transient failure does not lose the event ───
+// ── 6. retry behavior — transient failure does not lose the event ───
 
 test('transient network failure is buffered and re-sent on next successful capture', async (t) => {
   if (!ensureBackendOrSkip(t)) return;
@@ -207,7 +229,7 @@ test('transient network failure is buffered and re-sent on next successful captu
   assert.ok(messages.includes('contract: drain-trigger'), 'new event must be sent');
 });
 
-// ── 6. 401 from backend does not crash SDK ──────────────────────
+// ── 7. 401 from backend does not crash SDK ──────────────────────
 
 test('backend 401 INVALID_API_KEY does not crash the SDK', async (t) => {
   if (!ensureBackendOrSkip(t)) return;

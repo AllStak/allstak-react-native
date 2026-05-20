@@ -29,16 +29,47 @@
  */
 
 import { AllStak } from './client';
+import { wrap } from './provider';
 
-// ── Primary API: AllStakProvider (recommended) ──────────────────
-export { AllStakProvider, useAllStak, __resetProviderInstanceForTest } from './provider';
+(AllStak as typeof AllStak & { wrap?: typeof wrap }).wrap = wrap;
+
+// ── Primary API: init + wrap, plus Provider compatibility ──
+export {
+  AllStakProvider,
+  useAllStak,
+  wrap,
+  __resetProviderInstanceForTest,
+} from './provider';
 export type { AllStakProviderProps } from './provider';
 
 // ── Core client + manual setup ──────────────────────────────────
 export { AllStak } from './client';
-export type { AllStakConfig, Breadcrumb, ScreenshotArtifact, ScreenshotCaptureOptions } from './client';
+export type {
+  AllStakConfig,
+  Breadcrumb,
+  EventId,
+  LogLevel,
+  LogEnvelope,
+  ScreenshotArtifact,
+  ScreenshotCaptureOptions,
+  SeverityLevel,
+} from './client';
 export type { TransportStats } from './transport';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
+
+export const init = AllStak.init;
+export const captureException = AllStak.captureException;
+export const captureMessage = AllStak.captureMessage;
+export const log = AllStak.log;
+export const logger = AllStak.logger;
+export const addBreadcrumb = AllStak.addBreadcrumb;
+export const setUser = AllStak.setUser;
+export const setTag = AllStak.setTag;
+export const setTags = AllStak.setTags;
+export const setContext = AllStak.setContext;
+export const withScope = AllStak.withScope;
+export const startSpan = AllStak.startSpan;
+export const flush = AllStak.flush;
 
 // ── Flat screenshot API + masking primitives (0.4.0+) ───────────
 export {
@@ -61,8 +92,8 @@ export {
   resolveScreenshotConfig,
   pickScreenshotConfig,
   maybeCaptureScreenshot,
-  captureViaViewShot,
-  isViewShotAvailable,
+  captureViaNativeModule,
+  isNativeScreenshotAvailable,
   DEFAULT_SCREENSHOT_CONFIG,
 } from './screenshot';
 export type {
@@ -94,6 +125,18 @@ export {
 // ── Console capture types ───────────────────────────────────────
 export type { ConsoleCaptureOptions } from './auto-breadcrumbs';
 export { __resetConsoleInstrumentationFlagForTest } from './auto-breadcrumbs';
+
+// ── Rich event enrichment (0.5.0+) ──────────────────────────────
+export { collectAutoContexts, buildAutoRelease, resolveAutoRelease, buildUserContext } from './contexts';
+export type { AllStakContexts, CollectContextOptions } from './contexts';
+export {
+  buildExceptionChain,
+  extractAxiosRequest,
+  classifyHttpError,
+  maybeExtractHttpRequest,
+  sanitizeUrl,
+} from './mechanism';
+export type { MechanismType, ExceptionValue, SanitizedHttpRequest } from './mechanism';
 
 // ── Advanced modules ────────────────────────────────────────────
 export { ReplaySurrogate } from './replay-surrogate';
@@ -185,7 +228,7 @@ export async function drainPendingNativeCrashes(release?: string): Promise<void>
           AllStak.captureException(err, {
             ...(payload?.metadata || {}),
             'native.crash': 'true',
-          });
+          }, { mechanism: 'native_crash', handled: false });
         } catch { /* swallow */ }
       }
     }

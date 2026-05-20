@@ -7,11 +7,10 @@
 #
 #   "$SRCROOT/../node_modules/@allstak/react-native/build-hooks/xcode-build-phase.sh"
 #
-# Then set the env vars in the same Run Script panel (or via .xcconfig
-# / your CI shell):
+# Optional env vars:
 #
-#   ALLSTAK_RELEASE        = mobile@1.2.3+5
-#   ALLSTAK_UPLOAD_TOKEN   = aspk_…              # only required for upload
+#   ALLSTAK_RELEASE        = com.company.app@1.2.3+5  (optional override)
+#   ALLSTAK_UPLOAD_TOKEN   = build-only source-map upload credential
 #   ALLSTAK_HOST           = https://api.allstak.sa  (optional)
 #   ALLSTAK_DIST_OVERRIDE  = ios-hermes              (optional override)
 #
@@ -30,8 +29,19 @@ if [[ "${CONFIGURATION}" != "Release" ]]; then
 fi
 
 if [[ -z "${ALLSTAK_RELEASE}" ]]; then
-  echo "[allstak] ALLSTAK_RELEASE not set — skipping sourcemap upload"
-  exit 0
+  APP_ID="${PRODUCT_BUNDLE_IDENTIFIER:-}"
+  APP_VERSION="${MARKETING_VERSION:-}"
+  APP_BUILD="${CURRENT_PROJECT_VERSION:-}"
+  if [[ -n "${APP_ID}" && -n "${APP_VERSION}" ]]; then
+    ALLSTAK_RELEASE="${APP_ID}@${APP_VERSION}"
+    if [[ -n "${APP_BUILD}" ]]; then
+      ALLSTAK_RELEASE="${ALLSTAK_RELEASE}+${APP_BUILD}"
+    fi
+    echo "[allstak] derived release=${ALLSTAK_RELEASE}"
+  else
+    echo "[allstak] could not derive release from PRODUCT_BUNDLE_IDENTIFIER/MARKETING_VERSION and ALLSTAK_RELEASE is not set — skipping sourcemap upload"
+    exit 0
+  fi
 fi
 
 # Locate the bundle + map relative to standard React Native output paths.
@@ -78,6 +88,13 @@ if [[ -z "${NODE_BINARY}" || ! -x "${NODE_BINARY}" ]]; then
 fi
 
 DIST="${ALLSTAK_DIST_OVERRIDE:-ios-hermes}"
+if [[ -z "${ALLSTAK_UPLOAD_TOKEN:-}" ]]; then
+  PROP_FILE="${SRCROOT}/allstak.properties"
+  if [[ -f "${PROP_FILE}" ]]; then
+    ALLSTAK_UPLOAD_TOKEN="$(awk -F= '/^auth\.token=/{print substr($0, index($0,$2)); exit}' "${PROP_FILE}")"
+    export ALLSTAK_UPLOAD_TOKEN
+  fi
+fi
 
 echo "[allstak] uploading sourcemap for ${BUNDLE} (release=${ALLSTAK_RELEASE} dist=${DIST})"
 

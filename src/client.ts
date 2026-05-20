@@ -10,8 +10,8 @@
 import { HttpTransport, TransportStats } from './transport';
 import { parseStack } from './stack';
 import { resolveDebugId } from './utils/debug-id';
-import { Scope, mergeScopes } from './scope';
-import { TracingModule, Span } from './tracing';
+import { Scope, mergeScopes, type Severity } from './scope';
+import { TracingModule, Span, type SpanData, type SpanOptions } from './tracing';
 import { ReplaySurrogate, ReplaySurrogateOptions } from './replay-surrogate';
 import { HttpRequestModule } from './http-requests';
 import type { HttpTrackingOptions } from './http-redact';
@@ -30,22 +30,49 @@ import {
   type ScreenshotFailPolicy,
   type ScreenshotContext,
 } from './screenshot';
-import { detectRuntimeMode } from './runtime';
+import { detectRuntimeMode, tryRequire } from './runtime';
+import {
+  collectAutoContexts,
+  buildUserContext,
+  buildAutoRelease,
+  type AllStakContexts,
+  type CollectContextOptions,
+} from './contexts';
+import {
+  buildExceptionChain,
+  maybeExtractHttpRequest,
+  type MechanismType,
+  type ExceptionValue,
+  type SanitizedHttpRequest,
+} from './mechanism';
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.4.1';
+export const SDK_VERSION = '0.5.9';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';
-export type { SpanData } from './tracing';
+export type { SpanData, SpanOptions } from './tracing';
 
 const ERRORS_PATH = '/ingest/v1/errors';
 const LOGS_PATH = '/ingest/v1/logs';
+const PROFILES_PATH = '/ingest/v1/profiles';
+const SDK_LOAD_TIME = Date.now();
 
 const VALID_BREADCRUMB_TYPES = new Set(['http', 'log', 'ui', 'navigation', 'query', 'default']);
-const VALID_BREADCRUMB_LEVELS = new Set(['info', 'warn', 'error', 'debug']);
-const DEFAULT_MAX_BREADCRUMBS = 50;
+const VALID_BREADCRUMB_LEVELS = new Set(['fatal', 'error', 'warning', 'warn', 'log', 'info', 'debug']);
+const DEFAULT_MAX_BREADCRUMBS = 100;
+
+export type SeverityLevel = Severity;
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'warning' | 'error' | 'fatal';
+export type EventId = string;
+
+export interface LogEnvelope {
+  level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+  message: string;
+  timestamp: number;
+  attributes?: Record<string, unknown>;
+}
 
 export interface AllStakConfig {
   /** Project API key (`ask_live_…`). Required. */
@@ -65,7 +92,7 @@ export interface AllStakConfig {
    * Affects `captureException` (sets `payload.level`) and the default of
    * `captureMessage`. Customer-set default severity, mirrors `setLevel`.
    */
-  level?: 'fatal' | 'error' | 'warning' | 'info' | 'debug';
+  level?: SeverityLevel;
   /**
    * Custom grouping fingerprint applied to every event. The backend uses
    * this in place of stack-based grouping. Customer-set grouping override —
@@ -74,6 +101,16 @@ export interface AllStakConfig {
   fingerprint?: string[];
   /** Probability in [0, 1] that any new span is recorded. Default 1. */
   tracesSampleRate?: number;
+  /** Master switch for Sentry-style performance spans. Default: true. */
+  enablePerformance?: boolean;
+  /** Mutate or drop a performance span before it leaves the SDK. */
+  beforeSendSpan?: (span: SpanData) => SpanData | null | undefined;
+  /** URLs that should receive distributed tracing headers. Defaults to all non-AllStak HTTP calls. */
+  tracePropagationTargets?: (string | RegExp)[];
+  /** Mobile app-start, navigation, and JS frame-health spans. Default: true. */
+  enableMobileVitals?: boolean;
+  /** JS profile/frame-health sampling rate. Default follows tracesSampleRate. */
+  profilesSampleRate?: number;
   /** Service name attached to every span (defaults to release if unset). */
   service?: string;
   /**
@@ -85,14 +122,14 @@ export interface AllStakConfig {
   replay?: ReplaySurrogateOptions;
   /**
    * Auto-instrument outbound HTTP — wraps `fetch`, `XMLHttpRequest`, and
-   * (when present) `axios`. Default: false. Combine with `httpTracking`
+   * (when present) `axios`. Default: true. Combine with `httpTracking`
    * to control body/header capture and redaction. Idempotent.
    */
   enableHttpTracking?: boolean;
   /**
-   * Privacy + capture controls for HTTP instrumentation. Bodies and
-   * headers are OFF by default; auth headers and sensitive query params
-   * are ALWAYS redacted.
+   * Privacy + capture controls for HTTP instrumentation. Request/response
+   * bodies and headers are captured by default with sensitive data redacted.
+   * Auth headers and sensitive query params are ALWAYS redacted.
    */
   httpTracking?: HttpTrackingOptions;
   /**
@@ -101,6 +138,18 @@ export interface AllStakConfig {
    * logging). Set `{ log: true, info: true }` to opt-in.
    */
   captureConsole?: ConsoleCaptureOptions;
+  /**
+   * Enable structured log delivery through `AllStak.logger.*` /
+   * `AllStak.log(...)`. Default: false.
+   */
+  enableLogs?: boolean;
+  /**
+   * Mutate or drop a structured log before it is sent. Return `null` to drop.
+   * Sync or async. Throwing from the hook sends the original log.
+   */
+  beforeSendLog?: (log: LogEnvelope) =>
+    | LogEnvelope | null | undefined
+    | Promise<LogEnvelope | null | undefined>;
   maxBreadcrumbs?: number;
   /**
    * Probability in [0, 1] that any given error is sent. Default: 1 (no sampling).
@@ -116,15 +165,14 @@ export interface AllStakConfig {
     | ErrorIngestPayload | null | undefined
     | Promise<ErrorIngestPayload | null | undefined>;
   /**
-   * Optional fail-open screenshot capture. Off by default and provider-based
-   * so Expo/RN apps choose their own native or JS screenshot implementation.
-   * The SDK bounds timeout/size/sampling and drops screenshots before it can
-   * hurt app navigation, JS thread responsiveness, or telemetry delivery.
+   * Optional legacy provider-based screenshot capture. Prefer the flat
+   * screenshot options below; the SDK-owned native capture path is enabled
+   * by default.
    */
   screenshot?: ScreenshotCaptureOptions;
 
   // ── Flat screenshot API (preferred; wizard 0.1.16+ writes these) ────
-  /** Enable on-error screenshot capture. Default: false. */
+  /** Enable on-error screenshot capture. Default: true. */
   captureScreenshotOnError?: boolean;
   screenshotRedaction?: ScreenshotRedactionMode;
   screenshotMaskStyle?: ScreenshotMaskStyle;
@@ -148,6 +196,39 @@ export interface AllStakConfig {
   dist?: string;
   commitSha?: string;
   branch?: string;
+
+  // ── Rich event context (0.5.0+) ───────────────────────────────
+  /**
+   * Auto-collect device/os/app/react_native/runtime contexts on init.
+   * Default: true. Optional metadata packages (expo-application,
+   * expo-device, expo-constants, react-native-device-info) are
+   * lazy-required and missing deps simply produce shallower contexts.
+   */
+  captureDeviceContext?: boolean;
+  /** Include battery info (requires `expo-battery`). Default false. */
+  captureBattery?: boolean;
+  /** Include screen dimensions + orientation. Default true. */
+  captureScreenContext?: boolean;
+  /** Include user.email / user.ip_address on events. Default false. */
+  sendDefaultPii?: boolean;
+  /** Stamp client.ip on outgoing events. Default false. */
+  collectIpAddress?: boolean;
+  /**
+   * Mutate or drop a breadcrumb before it is appended to the buffer.
+   * Return `null` to drop. Errors thrown are swallowed; the original
+   * breadcrumb is appended so a buggy hook can't black-hole telemetry.
+   */
+  beforeBreadcrumb?: (crumb: Breadcrumb) => Breadcrumb | null | undefined;
+  /** Drop HTTP breadcrumbs/events whose URL matches any of these. */
+  denyUrls?: (string | RegExp)[];
+  /** When set, ONLY emit HTTP breadcrumbs/events for matching URLs. */
+  allowUrls?: (string | RegExp)[];
+  /** Extra keys to scrub from breadcrumb data + event metadata. */
+  scrubKeys?: string[];
+  /** Additional regexes to scrub from string values in event data. */
+  scrubPatterns?: RegExp[];
+  /** Maximum size of the breadcrumb ring buffer. Default 100. */
+  /** (`maxBreadcrumbs` already declared above) */
 }
 
 export interface ScreenshotArtifact {
@@ -169,6 +250,14 @@ export interface ScreenshotCaptureOptions {
   provider?: (reason: { type: 'error'; error: Error; traceId?: string; requestId?: string }) =>
     | ScreenshotArtifact | null | undefined
     | Promise<ScreenshotArtifact | null | undefined>;
+}
+
+interface NativePerformanceSnapshot {
+  native_app_start_ms?: number;
+  total_frames?: number;
+  slow_frames?: number;
+  frozen_frames?: number;
+  max_frame_delay_ms?: number;
 }
 
 export interface Breadcrumb {
@@ -214,6 +303,28 @@ export interface ErrorIngestPayload {
   breadcrumbs?: Breadcrumb[];
   fingerprint?: string[];
   debugMeta?: { images: Array<{ type: string; debugId: string }> };
+
+  // ── Rich event enrichments (0.5.0+) ───────────────────────────
+  /** UUID v4 generated for this event. */
+  eventId?: string;
+  /** ISO-8601 timestamp when the event was captured (client-side). */
+  timestamp?: string;
+  /** Was this error handled by the host? false for unhandled JS / promise / native crashes. */
+  handled?: boolean;
+  /** Entry point that captured the error. */
+  mechanism?: MechanismType;
+  /** Current screen / route at the time of capture. */
+  transaction?: string;
+  /** Exception chain (innermost first). Includes mechanism on the outermost. */
+  exception?: { values: ExceptionValue[] };
+  /** Context bags: device, os, app, react_native, runtime, user, trace. */
+  contexts?: AllStakContexts & {
+    trace?: { trace_id?: string; span_id?: string; parent_span_id?: string; op?: string; status?: string };
+  };
+  /** Product-owned tags dictionary (flat key/value). */
+  tags?: Record<string, string>;
+  /** HTTP request panel for AxiosError-shaped errors. */
+  request?: SanitizedHttpRequest;
 }
 
 function frameToString(f: PayloadFrame): string {
@@ -243,6 +354,34 @@ function firstRecentRequestId(recentFailed: ReadonlyArray<{ requestId?: string }
   return undefined;
 }
 
+function hasFlatScreenshotConfig(config: Record<string, unknown>): boolean {
+  return [
+    'captureScreenshotOnError',
+    'screenshotRedaction',
+    'screenshotMaskStyle',
+    'screenshotMaxBytes',
+    'screenshotQuality',
+    'screenshotFormat',
+    'screenshotSampleRate',
+    'screenshotOnUnhandledOnly',
+    'screenshotUploadTimeoutMs',
+    'screenshotCaptureTimeoutMs',
+    'screenshotNativeMode',
+    'screenshotFailPolicy',
+    'beforeScreenshotCapture',
+    'beforeScreenshotUpload',
+    'isScreenshotAllowed',
+  ].some((key) => Object.prototype.hasOwnProperty.call(config, key));
+}
+
+function normalizeLogLevel(level: LogLevel): 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' {
+  return level === 'warning' ? 'warn' : level;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 export class AllStakClient {
   private transport: HttpTransport;
   private config: AllStakConfig;
@@ -254,6 +393,14 @@ export class AllStakClient {
   private replay: ReplaySurrogate | null = null;
   private httpRequests: HttpRequestModule | null = null;
   private _instrumentAxios: ((axios: any) => any) | null = null;
+  private mobileFrameTimer: ReturnType<typeof setInterval> | null = null;
+  private profileTimer: ReturnType<typeof setInterval> | null = null;
+  /** Auto-collected contexts (device/os/app/react_native/runtime). */
+  private autoContexts: AllStakContexts = {};
+  /** Auto-collected tags (device_model, os, js_engine, ...). */
+  private autoTags: Record<string, string> = {};
+  /** Current screen / transaction name — set via setCurrentScreen() or nav auto-instrument. */
+  private currentTransaction: string | null = null;
 
   constructor(config: AllStakConfig) {
     this.config = { ...config };
@@ -261,22 +408,48 @@ export class AllStakClient {
     if (!this.config.sdkName) this.config.sdkName = SDK_NAME;
     if (!this.config.sdkVersion) this.config.sdkVersion = SDK_VERSION;
     if (!this.config.platform) this.config.platform = 'react-native';
+    // ── Auto-collect contexts (best-effort, lazy-required deps) ───────────────
+    try {
+      const opts: CollectContextOptions = {
+        captureDeviceContext: this.config.captureDeviceContext !== false,
+        captureBattery: this.config.captureBattery === true,
+        captureScreenContext: this.config.captureScreenContext !== false,
+        sendDefaultPii: this.config.sendDefaultPii === true,
+      };
+      const { contexts, tags } = collectAutoContexts(opts);
+      this.autoContexts = contexts;
+      this.autoTags = tags;
+      if (!this.config.release) this.config.release = buildAutoRelease(contexts.app);
+    } catch { /* never break init */ }
+
     this.sessionId = generateId();
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;
     const baseUrl = (config.host ?? INGEST_HOST).replace(/\/$/, '');
     this.transport = new HttpTransport(baseUrl, config.apiKey ?? '', Boolean(config.apiKey));
     this.tracing = new TracingModule(this.transport, {
-      service: config.service ?? config.release ?? '',
+      service: this.config.service ?? this.config.release ?? '',
       environment: this.config.environment ?? 'production',
-      tracesSampleRate: config.tracesSampleRate,
+      release: this.config.release,
+      sessionId: this.sessionId,
+      platform: this.config.platform,
+      tracesSampleRate: this.config.tracesSampleRate,
+      beforeSendSpan: this.config.beforeSendSpan,
     });
-    if (config.replay && (config.replay.enabled ?? true)) {
+    const autoPerformanceEnabled = this.config.enablePerformance === true ||
+      (this.config.enablePerformance !== false && typeof this.config.tracesSampleRate === 'number');
+    if (autoPerformanceEnabled && this.config.enableMobileVitals !== false) {
+      this.captureAppStartSpan();
+      this.installMobileFrameHealth();
+      this.installSampledStackProfiler();
+    }
+    if (this.config.replay && (this.config.replay.enabled ?? true)) {
       try {
-        this.replay = new ReplaySurrogate(this.transport, this.sessionId, config.replay);
+        this.replay = new ReplaySurrogate(this.transport, this.sessionId, this.config.replay);
         this.replay.start();
       } catch { /* never break init */ }
     }
-    if (config.enableHttpTracking) {
+
+    if (config.enableHttpTracking !== false) {
       try {
         this.httpRequests = new HttpRequestModule(this.transport);
         this.httpRequests.setDefaults({
@@ -296,6 +469,8 @@ export class AllStakClient {
             dist: this.config.dist,
             platform: this.config.platform,
             environment: this.config.environment,
+            sessionId: this.sessionId,
+            tracePropagationTargets: config.tracePropagationTargets,
           },
         );
         this._instrumentAxios = instrumentAxios;
@@ -315,8 +490,13 @@ export class AllStakClient {
 
   // ── Public API ────────────────────────────────────────────────────
 
-  captureException(error: Error, context?: Record<string, unknown>): void {
-    if (!this.passesSampleRate()) return;
+  captureException(
+    error: Error,
+    context?: Record<string, unknown>,
+    opts?: { mechanism?: MechanismType; handled?: boolean },
+  ): EventId | undefined {
+    if (!this.passesSampleRate()) return undefined;
+    const eventId = generateEventId();
     const frames = parseStack(error.stack).map((f) => ({
       ...f,
       platform: this.config.platform,
@@ -409,14 +589,52 @@ export class AllStakClient {
       fingerprint: eff.fingerprint,
     };
 
-    // Flat screenshot API path (preferred). Warn once if both APIs are
-    // configured; flat wins.
-    const flatPresent = this.config.captureScreenshotOnError === true;
+    // ── Rich event enrichments ─────────────────────────────────
+    const mechanism: MechanismType = opts?.mechanism ?? 'captureException';
+    const handled = opts?.handled ?? (mechanism === 'captureException' || mechanism === 'errorboundary');
+    payload.eventId = eventId;
+    payload.timestamp = new Date().toISOString();
+    payload.handled = handled;
+    payload.mechanism = mechanism;
+    if (this.currentTransaction) payload.transaction = this.currentTransaction;
+    payload.exception = { values: buildExceptionChain(error, mechanism, handled) };
+    const req = maybeExtractHttpRequest(error);
+    if (req) payload.request = req;
+    // contexts: merge auto + scope + base config.user
+    const userCtx = buildUserContext(eff.user, { sendDefaultPii: this.config.sendDefaultPii });
+    const traceCtx: Record<string, unknown> = {};
+    if (payload.traceId) traceCtx.trace_id = payload.traceId;
+    if (payload.spanId) traceCtx.span_id = payload.spanId;
+    if (payload.parentSpanId) traceCtx.parent_span_id = payload.parentSpanId;
+    payload.contexts = {
+      ...this.autoContexts,
+      ...(eff.contexts ?? {}),
+      ...(userCtx ? { user: userCtx } : {}),
+      ...(Object.keys(traceCtx).length > 0 ? { trace: traceCtx } : {}),
+    };
+    // tags: auto + scope + base
+    payload.tags = {
+      ...this.autoTags,
+      ...(this.config.tags ?? {}),
+      ...((eff.tags ?? {}) as Record<string, string>),
+      environment: this.config.environment ?? 'production',
+      ...(this.config.release ? { release: this.config.release } : {}),
+      ...(this.config.dist ? { dist: this.config.dist } : {}),
+    };
+
+    // Flat screenshot API path. Enabled by default through
+    // resolveScreenshotConfig(); callers can disable with
+    // captureScreenshotOnError:false. Warn once if both APIs are configured;
+    // flat wins.
+    const rawScreenshotConfig = this.config as unknown as Record<string, unknown>;
+    const sc = resolveScreenshotConfig(pickScreenshotConfig(rawScreenshotConfig));
     const callbackPresent = Boolean(this.config.screenshot?.provider);
+    const flatConfigured = hasFlatScreenshotConfig(rawScreenshotConfig);
+    const flatPresent = sc.captureScreenshotOnError === true && (!callbackPresent || flatConfigured);
     warnIfBothApisPresent(callbackPresent, flatPresent);
 
     if (flatPresent) {
-      void this.runFlatScreenshotPipeline(error, payload).catch(() => {
+      void this.runFlatScreenshotPipeline(error, payload, sc).catch(() => {
         // Pipeline is fail-open, but belt-and-braces: ensure the event
         // ships even if something inside throws synchronously.
         void this.sendThroughBeforeSend({
@@ -424,7 +642,7 @@ export class AllStakClient {
           metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'failed' },
         });
       });
-      return;
+      return eventId;
     }
 
     if (this.shouldCaptureScreenshot()) {
@@ -434,7 +652,7 @@ export class AllStakClient {
           ...payload,
           metadata: { ...(payload.metadata ?? {}), 'screenshot.status': 'failed' },
         }));
-      return;
+      return eventId;
     }
     this.sendThroughBeforeSend({
       ...payload,
@@ -443,6 +661,7 @@ export class AllStakClient {
         'screenshot.status': this.config.screenshot?.enabled ? 'unsupported' : 'disabled',
       },
     });
+    return eventId;
   }
 
   /**
@@ -455,8 +674,9 @@ export class AllStakClient {
   private async runFlatScreenshotPipeline(
     error: Error,
     payload: ErrorIngestPayload,
+    sc?: ScreenshotConfig,
   ): Promise<void> {
-    const sc = resolveScreenshotConfig(pickScreenshotConfig(this.config as unknown as Record<string, unknown>));
+    sc = sc ?? resolveScreenshotConfig(pickScreenshotConfig(this.config as unknown as Record<string, unknown>));
     const runtimeMode = detectRuntimeMode();
     const ctx: ScreenshotContext = { error, unhandled: true, runtimeMode };
 
@@ -491,7 +711,9 @@ export class AllStakClient {
       },
     };
 
-    // Send the event and capture the server-assigned id so we can attach.
+    // Send the event once. If no screenshot was captured there is no
+    // attachment to link, so keep the normal transport path for buffering,
+    // circuit-breaker accounting, and fail-open behavior.
     let finalPayload: ErrorIngestPayload | null | undefined = eventPayload;
     if (this.config.beforeSend) {
       try { finalPayload = await this.config.beforeSend(eventPayload); }
@@ -499,6 +721,13 @@ export class AllStakClient {
     }
     if (!finalPayload) return;
 
+    if (!captured || !this.transport.isEnabled()) {
+      void this.transport.send(ERRORS_PATH, finalPayload);
+      return;
+    }
+
+    // Screenshot exists: send and read the server-assigned id so the
+    // attachment can be associated with the error event.
     let eventId: string | null = null;
     try {
       const resp = await this.transport.sendAndRead<{ data?: { id?: string }; id?: string }>(
@@ -507,7 +736,12 @@ export class AllStakClient {
       eventId = resp?.data?.id ?? resp?.id ?? null;
     } catch { /* fail-open */ }
 
-    if (!captured || !eventId) return;
+    if (!eventId) {
+      void this.transport.send(ERRORS_PATH, finalPayload);
+      return;
+    }
+
+    if (!captured) return;
 
     // Upload attachment with separate timeout / bounded retries.
     try {
@@ -538,7 +772,7 @@ export class AllStakClient {
   }
 
   /** Start a new span. Auto-parented to any currently-active span. */
-  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
+  startSpan(operation: string, options?: SpanOptions): Span {
     return this.tracing.startSpan(operation, options);
   }
   /** Get (and lazily create) the active trace ID. */
@@ -552,16 +786,19 @@ export class AllStakClient {
 
   captureMessage(
     message: string,
-    level: 'fatal' | 'error' | 'warning' | 'info' = 'info',
+    level: SeverityLevel = 'info',
     options: { as?: 'log' | 'error' | 'both' } = {},
-  ): void {
-    const as = options.as ?? (level === 'fatal' || level === 'error' ? 'both' : 'log');
+  ): EventId | undefined {
+    const as = options.as ?? 'error';
     if (as === 'log' || as === 'both') {
-      this.sendLog(level === 'warning' ? 'warn' : level, message);
+      this.log(level === 'warning' ? 'warn' : level === 'log' ? 'info' : level, message);
     }
     if (as === 'error' || as === 'both') {
-      if (!this.passesSampleRate()) return;
+      if (!this.passesSampleRate()) return undefined;
+      const eventId = generateEventId();
       const eff = this.effective();
+      const currentBreadcrumbs = this.breadcrumbs.length > 0 ? [...this.breadcrumbs] : undefined;
+      this.breadcrumbs = [];
       const payload: ErrorIngestPayload = {
         exceptionClass: 'Message',
         message,
@@ -578,10 +815,40 @@ export class AllStakClient {
         service: this.config.service,
         user: eff.user,
         metadata: this.buildMetadata(),
+        breadcrumbs: currentBreadcrumbs,
         fingerprint: eff.fingerprint,
       };
+      payload.eventId = eventId;
+      payload.timestamp = new Date().toISOString();
+      payload.handled = true;
+      payload.mechanism = 'captureMessage';
+      if (this.currentTransaction) payload.transaction = this.currentTransaction;
+      const userCtx = buildUserContext(eff.user, { sendDefaultPii: this.config.sendDefaultPii });
+      const traceCtx: Record<string, unknown> = {};
+      if (payload.traceId) traceCtx.trace_id = payload.traceId;
+      if (payload.spanId) traceCtx.span_id = payload.spanId;
+      payload.contexts = {
+        ...this.autoContexts,
+        ...(eff.contexts ?? {}),
+        ...(userCtx ? { user: userCtx } : {}),
+        ...(Object.keys(traceCtx).length > 0 ? { trace: traceCtx } : {}),
+      };
+      payload.tags = {
+        ...this.autoTags,
+        ...(this.config.tags ?? {}),
+        ...((eff.tags ?? {}) as Record<string, string>),
+        environment: this.config.environment ?? 'production',
+        ...(this.config.release ? { release: this.config.release } : {}),
+        ...(this.config.dist ? { dist: this.config.dist } : {}),
+      };
       this.sendThroughBeforeSend(payload);
+      return eventId;
     }
+    return undefined;
+  }
+
+  log(level: LogLevel, message: string, attributes?: Record<string, unknown>): void {
+    this.sendLog(normalizeLogLevel(level), message, attributes);
   }
 
   addBreadcrumb(
@@ -590,15 +857,67 @@ export class AllStakClient {
     level?: string,
     data?: Record<string, unknown>,
   ): void {
-    const crumb: Breadcrumb = {
+    let crumb: Breadcrumb = {
       timestamp: new Date().toISOString(),
       type: VALID_BREADCRUMB_TYPES.has(type) ? type : 'default',
       message,
       level: level && VALID_BREADCRUMB_LEVELS.has(level) ? level : 'info',
       ...(data ? { data } : {}),
     };
+
+    // URL filtering for http breadcrumbs (denyUrls/allowUrls).
+    if (crumb.type === 'http' && (this.config.denyUrls || this.config.allowUrls)) {
+      const url = typeof crumb.data?.url === 'string' ? crumb.data.url as string : '';
+      if (url) {
+        if (this.config.denyUrls && this.config.denyUrls.some((p) => matchUrlPattern(url, p))) return;
+        if (this.config.allowUrls && this.config.allowUrls.length > 0 &&
+            !this.config.allowUrls.some((p) => matchUrlPattern(url, p))) return;
+      }
+    }
+
+    // Scrub configured keys from the breadcrumb data.
+    if (crumb.data && this.config.scrubKeys && this.config.scrubKeys.length > 0) {
+      crumb = { ...crumb, data: scrubObject(crumb.data, this.config.scrubKeys) };
+    }
+
+    // beforeBreadcrumb hook — fail-open.
+    if (this.config.beforeBreadcrumb) {
+      try {
+        const out = this.config.beforeBreadcrumb(crumb);
+        if (out === null) return; // explicit drop
+        if (out) crumb = out;
+      } catch { /* swallow — keep original */ }
+    }
+
     if (this.breadcrumbs.length >= this.maxBreadcrumbs) this.breadcrumbs.shift();
     this.breadcrumbs.push(crumb);
+  }
+
+  /**
+   * Set the current screen / route name. Stamps `transaction` on every
+   * subsequent event and emits a `navigation` breadcrumb. Use this when
+   * not on `@react-navigation/native` (the nav auto-instrument calls
+   * this for you).
+   */
+  setCurrentScreen(name: string): void {
+    if (!name) return;
+    const prev = this.currentTransaction;
+    this.currentTransaction = name;
+    if (prev !== name) {
+      this.addBreadcrumb('navigation', `${prev ?? '<start>'} -> ${name}`, 'info', {
+        from: prev, to: name,
+      });
+    }
+  }
+
+  /** @internal — current transaction (or undefined). */
+  getCurrentTransaction(): string | undefined {
+    return this.currentTransaction ?? undefined;
+  }
+
+  /** @internal — set transaction without emitting a breadcrumb. */
+  __setTransactionSilent(name: string | null): void {
+    this.currentTransaction = name && name.length > 0 ? name : null;
   }
 
   clearBreadcrumbs(): void {
@@ -652,7 +971,7 @@ export class AllStakClient {
   }
 
   /** Set the default severity level applied to subsequent captures. */
-  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void {
+  setLevel(level: SeverityLevel): void {
     this.config.level = level;
   }
 
@@ -678,6 +997,8 @@ export class AllStakClient {
   getTransportStats(): TransportStats { return this.transport.getStats(); }
 
   destroy(): void {
+    if (this.mobileFrameTimer) { clearInterval(this.mobileFrameTimer); this.mobileFrameTimer = null; }
+    if (this.profileTimer) { clearInterval(this.profileTimer); this.profileTimer = null; }
     this.tracing.destroy();
     if (this.replay) { this.replay.destroy(); this.replay = null; }
     if (this.httpRequests) { this.httpRequests.destroy(); this.httpRequests = null; }
@@ -686,21 +1007,219 @@ export class AllStakClient {
     this.breadcrumbs = [];
   }
 
+  private captureAppStartSpan(): void {
+    void this.getNativePerformanceSnapshot()
+      .then((snapshot) => this.captureAppStartSpanFromSnapshot(snapshot))
+      .catch(() => this.captureAppStartSpanFromSnapshot(null));
+  }
+
+  private captureAppStartSpanFromSnapshot(snapshot: NativePerformanceSnapshot | null): void {
+    const now = Date.now();
+    const nativeDuration = numberOrUndefined(snapshot?.native_app_start_ms);
+    const duration = nativeDuration ?? Math.max(0, now - SDK_LOAD_TIME);
+    const source = nativeDuration != null ? 'native' : 'js';
+    const span = this.tracing.startSpan('app.start', {
+      op: 'app.start',
+      platform: this.config.platform ?? 'react-native',
+      description: source === 'native' ? 'Native app start' : 'JS app start',
+      startTimeMillis: source === 'native' ? now - duration : SDK_LOAD_TIME,
+      measurements: source === 'native'
+        ? { native_app_start_ms: duration }
+        : { js_app_start_ms: duration },
+      attributes: {
+        session_id: this.sessionId,
+        release: this.config.release,
+        dist: this.config.dist,
+      },
+      tags: { type: source },
+    });
+    span.finish('ok', now);
+  }
+
+  private installMobileFrameHealth(): void {
+    const rate = this.config.profilesSampleRate ?? this.config.tracesSampleRate ?? 0;
+    if (rate <= 0 || Math.random() >= rate) return;
+    let last = Date.now();
+    let slowFrames = 0;
+    let frozenFrames = 0;
+    let maxDelay = 0;
+    let ticks = 0;
+    const intervalMs = 500;
+    const flushEveryTicks = 20;
+    this.mobileFrameTimer = setInterval(() => {
+      void this.getNativePerformanceSnapshot()
+        .then((snapshot) => {
+          if (!snapshot) return false;
+          const total = numberOrUndefined(snapshot.total_frames) ?? 0;
+          const nativeSlow = numberOrUndefined(snapshot.slow_frames) ?? 0;
+          const nativeFrozen = numberOrUndefined(snapshot.frozen_frames) ?? 0;
+          const nativeMax = numberOrUndefined(snapshot.max_frame_delay_ms) ?? 0;
+          if (total <= 0 && nativeSlow <= 0 && nativeFrozen <= 0 && nativeMax <= 0) return true;
+          this.captureFrameHealthSpan('native', {
+            total_frames: total,
+            slow_frames: nativeSlow,
+            frozen_frames: nativeFrozen,
+            max_frame_delay_ms: nativeMax,
+          });
+          return true;
+        })
+        .then((nativeHandled) => {
+          if (nativeHandled) return;
+          const now = Date.now();
+          const delay = Math.max(0, now - last - intervalMs);
+          last = now;
+          ticks += 1;
+          if (delay > 50) slowFrames += 1;
+          if (delay > 700) frozenFrames += 1;
+          if (delay > maxDelay) maxDelay = delay;
+          if (ticks < flushEveryTicks) return;
+
+          this.captureFrameHealthSpan('js', {
+            slow_frames: slowFrames,
+            frozen_frames: frozenFrames,
+            max_frame_delay_ms: maxDelay,
+          });
+          slowFrames = 0;
+          frozenFrames = 0;
+          maxDelay = 0;
+          ticks = 0;
+        })
+        .catch(() => undefined);
+    }, intervalMs);
+    (this.mobileFrameTimer as any)?.unref?.();
+  }
+
+  private installSampledStackProfiler(): void {
+    const rate = this.config.profilesSampleRate ?? 0;
+    if (rate <= 0 || Math.random() >= rate) return;
+
+    const startedAt = Date.now();
+    const profileId = generateId();
+    const intervalMs = 100;
+    const flushEveryMs = 10_000;
+    const samples: Array<{
+      elapsedMs: number;
+      thread: string;
+      stack: Array<{ function?: string; file?: string; line?: number; column?: number }>;
+    }> = [];
+
+    const flush = () => {
+      if (samples.length === 0) return;
+      const chunk = samples.splice(0, samples.length);
+      this.transport.send(PROFILES_PATH, {
+        profiles: [{
+          profileId,
+          traceId: this.tracing.getTraceId(),
+          spanId: this.tracing.getCurrentSpanId() ?? undefined,
+          sessionId: this.sessionId,
+          release: this.config.release,
+          environment: this.config.environment,
+          platform: this.config.platform ?? 'react-native',
+          runtime: 'react-native-js',
+          profileType: 'sampled_stack',
+          durationMs: Date.now() - startedAt,
+          sampleCount: chunk.length,
+          samples: chunk,
+          measurements: { sample_interval_ms: intervalMs },
+          attributes: {
+            screen: this.currentTransaction ?? '',
+            sdk_name: this.config.sdkName ?? SDK_NAME,
+            sdk_version: this.config.sdkVersion ?? SDK_VERSION,
+          },
+          timestampMillis: Date.now(),
+        }],
+      });
+    };
+
+    this.profileTimer = setInterval(() => {
+      const elapsedMs = Date.now() - startedAt;
+      const stack = parseStack(new Error('AllStak profile sample').stack)
+        .slice(1, 65)
+        .map((f) => ({
+          function: f.function,
+          file: f.filename || f.absPath,
+          line: f.lineno,
+          column: f.colno,
+        }));
+      samples.push({ elapsedMs, thread: 'js', stack });
+      if (elapsedMs > 0 && elapsedMs % flushEveryMs < intervalMs) flush();
+    }, intervalMs);
+    (this.profileTimer as any)?.unref?.();
+  }
+
+  private captureFrameHealthSpan(source: 'native' | 'js', measurements: Record<string, number>): void {
+    const span = this.tracing.startSpan('mobile.frame', {
+      op: 'mobile.frame',
+      platform: this.config.platform ?? 'react-native',
+      description: source === 'native' ? 'Native frame health' : 'JS frame health',
+      measurements,
+      attributes: {
+        session_id: this.sessionId,
+        release: this.config.release,
+        dist: this.config.dist,
+      },
+      tags: { source },
+    });
+    span.finish('ok');
+  }
+
+  private async getNativePerformanceSnapshot(): Promise<NativePerformanceSnapshot | null> {
+    try {
+      const rn = tryRequire<any>('react-native');
+      const native = rn?.NativeModules?.AllStakNative;
+      if (!native || typeof native.getPerformanceSnapshot !== 'function') return null;
+      const snapshot = await Promise.resolve(native.getPerformanceSnapshot());
+      return snapshot && typeof snapshot === 'object' ? snapshot as NativePerformanceSnapshot : null;
+    } catch {
+      return null;
+    }
+  }
+
   // ── Internal ──────────────────────────────────────────────────────
 
-  private sendLog(level: string, message: string): void {
-    this.transport.send(LOGS_PATH, {
-      timestamp: new Date().toISOString(),
+  private sendLog(
+    level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal',
+    message: string,
+    attributes?: Record<string, unknown>,
+  ): void {
+    if (this.config.enableLogs !== true) return;
+    const log: LogEnvelope = {
+      timestamp: Date.now(),
       level,
       message,
-      sessionId: this.sessionId,
-      environment: this.config.environment,
-      release: this.config.release,
-      platform: this.config.platform,
-      sdkName: this.config.sdkName,
-      sdkVersion: this.config.sdkVersion,
-      metadata: this.buildMetadata(),
-    });
+      ...(attributes ? { attributes } : {}),
+    };
+
+    const send = (next: LogEnvelope | null | undefined) => {
+      if (!next) return;
+      this.transport.send(LOGS_PATH, {
+        timestamp: new Date(next.timestamp).toISOString(),
+        level: next.level,
+        message: next.message,
+        sessionId: this.sessionId,
+        environment: this.config.environment,
+        release: this.config.release,
+        platform: this.config.platform,
+        sdkName: this.config.sdkName,
+        sdkVersion: this.config.sdkVersion,
+        metadata: { ...this.buildMetadata(), ...(next.attributes ?? {}) },
+      });
+    };
+
+    if (!this.config.beforeSendLog) {
+      send(log);
+      return;
+    }
+    try {
+      const result = this.config.beforeSendLog(log);
+      if (result && typeof (result as Promise<LogEnvelope | null | undefined>).then === 'function') {
+        void (result as Promise<LogEnvelope | null | undefined>).then(send).catch(() => send(log));
+      } else {
+        send(result as LogEnvelope | null | undefined);
+      }
+    } catch {
+      send(log);
+    }
   }
 
   private shouldCaptureScreenshot(): boolean {
@@ -856,7 +1375,7 @@ function maybeInit(): AllStakClient | null {
 }
 
 function noopSpan(operation = ''): Span {
-  return new Span('', '', '', operation, '', '', '', {}, () => undefined);
+  return new Span('', '', '', operation, operation, 'react-native', '', '', '', undefined, undefined, 0, 0, {}, {}, {}, () => undefined);
 }
 
 function emptyStats(): TransportStats {
@@ -885,7 +1404,7 @@ export function __safeAddBreadcrumbForInstrumentation(
   catch { /* never break host */ }
 }
 
-export const AllStak = {
+export const AllStak: any = {
   init(config: AllStakConfig): AllStakClient {
     try {
       if (instance) instance.destroy();
@@ -896,15 +1415,30 @@ export const AllStak = {
       return instance;
     }
   },
-  captureException(error: Error, context?: Record<string, unknown>): void {
-    try { maybeInit()?.captureException(error, context); } catch { /* fail-open */ }
+  captureException(
+    error: Error,
+    context?: Record<string, unknown>,
+    opts?: { mechanism?: MechanismType; handled?: boolean },
+  ): EventId | undefined {
+    try { return maybeInit()?.captureException(error, context, opts); } catch { return undefined; }
   },
   captureMessage(
     message: string,
-    level: 'fatal' | 'error' | 'warning' | 'info' = 'info',
+    level: SeverityLevel = 'info',
     options?: { as?: 'log' | 'error' | 'both' },
-  ): void {
-    try { maybeInit()?.captureMessage(message, level, options); } catch { /* fail-open */ }
+  ): EventId | undefined {
+    try { return maybeInit()?.captureMessage(message, level, options); } catch { return undefined; }
+  },
+  log(level: LogLevel, message: string, attributes?: Record<string, unknown>): void {
+    try { maybeInit()?.log(level, message, attributes); } catch { /* fail-open */ }
+  },
+  logger: {
+    trace(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('trace', message, attributes); } catch { /* fail-open */ } },
+    debug(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('debug', message, attributes); } catch { /* fail-open */ } },
+    info(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('info', message, attributes); } catch { /* fail-open */ } },
+    warn(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('warn', message, attributes); } catch { /* fail-open */ } },
+    error(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('error', message, attributes); } catch { /* fail-open */ } },
+    fatal(message: string, attributes?: Record<string, unknown>): void { try { maybeInit()?.log('fatal', message, attributes); } catch { /* fail-open */ } },
   },
   addBreadcrumb(type: string, message: string, level?: string, data?: Record<string, unknown>): void {
     try { maybeInit()?.addBreadcrumb(type, message, level, data); } catch { /* fail-open */ }
@@ -916,7 +1450,7 @@ export const AllStak = {
   setExtra(key: string, value: unknown): void { try { maybeInit()?.setExtra(key, value); } catch { /* fail-open */ } },
   setExtras(extras: Record<string, unknown>): void { try { maybeInit()?.setExtras(extras); } catch { /* fail-open */ } },
   setContext(name: string, ctx: Record<string, unknown> | null): void { try { maybeInit()?.setContext(name, ctx); } catch { /* fail-open */ } },
-  setLevel(level: 'fatal' | 'error' | 'warning' | 'info' | 'debug'): void { try { maybeInit()?.setLevel(level); } catch { /* fail-open */ } },
+  setLevel(level: SeverityLevel): void { try { maybeInit()?.setLevel(level); } catch { /* fail-open */ } },
   setFingerprint(fingerprint: string[] | null): void { try { maybeInit()?.setFingerprint(fingerprint); } catch { /* fail-open */ } },
   flush(timeoutMs?: number): Promise<boolean> {
     try { return maybeInit()?.flush(timeoutMs) ?? Promise.resolve(true); }
@@ -924,6 +1458,17 @@ export const AllStak = {
   },
   setIdentity(identity: { sdkName?: string; sdkVersion?: string; platform?: string; dist?: string }): void {
     try { maybeInit()?.setIdentity(identity); } catch { /* fail-open */ }
+  },
+  /** Set the current screen / transaction name. Stamps event.transaction + emits nav breadcrumb. */
+  setCurrentScreen(name: string): void {
+    try { maybeInit()?.setCurrentScreen(name); } catch { /* fail-open */ }
+  },
+  getCurrentTransaction(): string | undefined {
+    try { return maybeInit()?.getCurrentTransaction(); } catch { return undefined; }
+  },
+  /** @internal — set transaction without emitting a breadcrumb (nav auto-instrument uses this). */
+  __setTransactionSilent(name: string | null): void {
+    try { maybeInit()?.__setTransactionSilent(name); } catch { /* fail-open */ }
   },
   /**
    * Run `callback` with a fresh scoped context. Any user/tag/extra/context/
@@ -938,7 +1483,7 @@ export const AllStak = {
     }
     catch { return callback(new Scope()); }
   },
-  startSpan(operation: string, options?: { description?: string; tags?: Record<string, string> }): Span {
+  startSpan(operation: string, options?: SpanOptions): Span {
     try { return maybeInit()?.startSpan(operation, options) ?? noopSpan(operation); }
     catch { return noopSpan(operation); }
   },
@@ -969,6 +1514,32 @@ export const AllStak = {
   /** @internal — exposed for testing */
   _getInstance(): AllStakClient | null { return instance; },
 };
+
+function matchUrlPattern(url: string, p: string | RegExp): boolean {
+  if (!url || !p) return false;
+  if (typeof p === 'string') return url.includes(p);
+  try { return p.test(url); } catch { return false; }
+}
+
+function scrubObject(
+  obj: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> {
+  if (!obj || keys.length === 0) return obj;
+  const out: Record<string, unknown> = {};
+  const lower = new Set(keys.map((k) => k.toLowerCase()));
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = lower.has(k.toLowerCase()) ? '[Filtered]' : v;
+  }
+  return out;
+}
+
+function generateEventId(): string {
+  // RFC4122-ish v4. Same approach as the session ID.
+  const hex = (n: number) => Math.floor(Math.random() * n).toString(16).padStart(1, '0');
+  const seg = (len: number) => Array.from({ length: len }, () => hex(16)).join('');
+  return `${seg(8)}-${seg(4)}-4${seg(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${seg(3)}-${seg(12)}`;
+}
 
 function byteSize(value?: string): number {
   if (!value) return 0;

@@ -14,17 +14,17 @@
  *            "node node_modules/@allstak/react-native/build-hooks/eas-post-bundle.js"
  *        }
  *
- *   2. Set these in eas.json secrets (or as EAS env vars):
+ *   2. Optional env overrides:
  *
- *        ALLSTAK_RELEASE        — required (e.g. "mobile@1.2.3+5")
- *        ALLSTAK_UPLOAD_TOKEN   — required for actual upload
+ *        ALLSTAK_RELEASE        — optional override (e.g. "com.company.app@1.2.3+5")
  *        ALLSTAK_HOST           — optional override
  *
  * What this hook does:
  *   • Probes EAS's standard output paths for both iOS and Android Hermes
  *     bundles + composed source maps.
  *   • Calls the SDK's uploader for each platform that produced artifacts.
- *   • Falls back to inject-only mode when no token is set.
+ *   • Uses the build-only upload token already written by the wizard when present.
+ *   • Falls back to inject-only mode when no upload token is set.
  *   • Always exits 0 — never fails an EAS build over a sourcemap glitch.
  *
  * If you build outside of EAS (bare RN, custom CI), use
@@ -37,22 +37,58 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const RELEASE = process.env.ALLSTAK_RELEASE;
-const TOKEN = process.env.ALLSTAK_UPLOAD_TOKEN;
-
-if (!RELEASE) {
-  console.warn('[allstak] ALLSTAK_RELEASE not set — skipping sourcemap upload');
-  process.exit(0);
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return null; }
 }
 
+function readEnvFiles(root) {
+  const out = {};
+  for (const name of ['.env.local', '.env']) {
+    const file = path.join(root, name);
+    if (!fs.existsSync(file)) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+      if (!match || match[1].startsWith('#')) continue;
+      if (out[match[1]] !== undefined) continue;
+      out[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+    }
+  }
+  return out;
+}
+
+function resolveRelease(root) {
+  if (process.env.ALLSTAK_RELEASE) return process.env.ALLSTAK_RELEASE;
+  const appJson = readJson(path.join(root, 'app.json'));
+  const appConfigJson = readJson(path.join(root, 'app.config.json'));
+  const expo = appConfigJson?.expo ?? appJson?.expo ?? appConfigJson ?? appJson ?? {};
+  const id = expo.ios?.bundleIdentifier ?? expo.android?.package ?? expo.slug ?? expo.name;
+  const version = expo.version;
+  const build = expo.ios?.buildNumber ?? expo.android?.versionCode;
+  if (!id || !version) return null;
+  return `${id}@${version}${build != null && String(build).length > 0 ? '+' + build : ''}`;
+}
+
+const root = process.env.EAS_BUILD_WORKINGDIR || process.cwd();
+const RELEASE = resolveRelease(root);
+const dotenv = readEnvFiles(root);
+const TOKEN = process.env.ALLSTAK_UPLOAD_TOKEN || dotenv.ALLSTAK_UPLOAD_TOKEN;
+
+if (!RELEASE) {
+  console.warn('[allstak] could not derive release from Expo config and ALLSTAK_RELEASE is not set — skipping sourcemap upload');
+  process.exit(0);
+}
+process.env.ALLSTAK_RELEASE = RELEASE;
+
 if (!TOKEN) {
-  console.warn('[allstak] ALLSTAK_UPLOAD_TOKEN not set — running in inject-only mode');
+  console.warn('[allstak] no build-only upload token found — running in inject-only mode');
+} else {
+  process.env.ALLSTAK_UPLOAD_TOKEN = TOKEN;
 }
 
 // EAS sets EAS_BUILD_WORKINGDIR to the per-build working directory.
 // Outside of EAS it falls back to cwd.
-const root = process.env.EAS_BUILD_WORKINGDIR || process.cwd();
-
 // Probe locations for each platform. EAS runs the standard
 // `npx react-native bundle` in a temp dir under android/ios — these
 // are the conventional output names.

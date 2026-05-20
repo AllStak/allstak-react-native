@@ -1,11 +1,9 @@
 /**
  * HTTP request batching + transport for the React Native SDK.
  *
- * Mirrors the wire shape used by `@allstak/js`'s HttpRequestModule so the
- * existing backend ingest endpoint (`/ingest/v1/http-requests`) accepts
- * events from this SDK without a schema change. Adds optional rich fields
- * (headers, bodies, error string) — these ride alongside the existing
- * required fields and are tolerated as additive metadata server-side.
+ * Mirrors the wire shape accepted by the backend ingest endpoint
+ * (`/ingest/v1/http-requests`). Headers are serialized as JSON strings and
+ * body capture metadata uses the backend's `*BodyCapture*` field names.
  *
  * Batching:
  *   - flushes on a 5s timer OR when 20 events queue up
@@ -41,6 +39,10 @@ export interface HttpRequestEvent {
   error?: string;
   requestBodyStatus?: string;
   responseBodyStatus?: string;
+  requestBodyCaptureStatus?: string;
+  responseBodyCaptureStatus?: string;
+  requestBodyCaptureReason?: string;
+  responseBodyCaptureReason?: string;
   requestBodyRedactedFields?: string[];
   responseBodyRedactedFields?: string[];
   requestBodyTruncated?: boolean;
@@ -66,13 +68,15 @@ export interface HttpRequestIngestItem {
   responseSize?: number;
   requestBody?: string;
   responseBody?: string;
-  requestHeaders?: Record<string, string>;
-  responseHeaders?: Record<string, string>;
+  requestHeaders?: string;
+  responseHeaders?: string;
   error?: string;
   spanId?: string;
   parentSpanId?: string;
-  requestBodyStatus?: string;
-  responseBodyStatus?: string;
+  requestBodyCaptureStatus?: string;
+  responseBodyCaptureStatus?: string;
+  requestBodyCaptureReason?: string;
+  responseBodyCaptureReason?: string;
   requestBodyRedactedFields?: string[];
   responseBodyRedactedFields?: string[];
   requestBodyTruncated?: boolean;
@@ -156,13 +160,15 @@ export class HttpRequestModule {
       responseSize: ev.responseSize,
       requestBody: ev.requestBody,
       responseBody: ev.responseBody,
-      requestHeaders: ev.requestHeaders,
-      responseHeaders: ev.responseHeaders,
+      requestHeaders: serializeHeaders(ev.requestHeaders),
+      responseHeaders: serializeHeaders(ev.responseHeaders),
       error: ev.error,
       spanId: ev.spanId,
       parentSpanId: ev.parentSpanId,
-      requestBodyStatus: ev.requestBodyStatus,
-      responseBodyStatus: ev.responseBodyStatus,
+      requestBodyCaptureStatus: normalizeCaptureStatus(ev.requestBodyCaptureStatus ?? ev.requestBodyStatus),
+      responseBodyCaptureStatus: normalizeCaptureStatus(ev.responseBodyCaptureStatus ?? ev.responseBodyStatus),
+      requestBodyCaptureReason: ev.requestBodyCaptureReason ?? captureReason(ev.requestBodyTruncated, ev.requestBodyRedactedFields, ev.capturePolicy),
+      responseBodyCaptureReason: ev.responseBodyCaptureReason ?? captureReason(ev.responseBodyTruncated, ev.responseBodyRedactedFields, ev.capturePolicy),
       requestBodyRedactedFields: ev.requestBodyRedactedFields,
       responseBodyRedactedFields: ev.responseBodyRedactedFields,
       requestBodyTruncated: ev.requestBodyTruncated,
@@ -214,4 +220,26 @@ export class HttpRequestModule {
 
   /** @internal — for tests. */
   getQueueSize(): number { return this.queue.length; }
+}
+
+function serializeHeaders(headers: Record<string, string> | undefined): string | undefined {
+  if (!headers || Object.keys(headers).length === 0) return undefined;
+  try { return JSON.stringify(headers); } catch { return undefined; }
+}
+
+function normalizeCaptureStatus(status: string | undefined): string | undefined {
+  if (!status) return undefined;
+  return status === 'empty' ? 'disabled' : status;
+}
+
+function captureReason(
+  truncated: boolean | undefined,
+  redactedFields: string[] | undefined,
+  policy: string | undefined,
+): string | undefined {
+  if (truncated) return 'Body exceeded the configured size limit and was truncated';
+  if (redactedFields && redactedFields.length > 0) return `Sensitive fields redacted: ${redactedFields.join(', ')}`;
+  if (policy === 'empty_body') return 'No body was provided for this request';
+  if (policy && policy !== 'automatic_body_capture') return policy;
+  return undefined;
 }

@@ -52,6 +52,43 @@ export interface ReactNativeInstallOptions {
    * called manually.
    */
   debugLogs?: boolean;
+  /**
+   * Install the linked native crash handler and drain any crash stored from
+   * the previous launch. Default: true. No-ops in Expo Go / JS-only runtimes
+   * where the native module is unavailable.
+   */
+  autoNativeCrashHandling?: boolean;
+}
+
+async function installAndDrainNativeCrashes(): Promise<void> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const rn = require('react-native');
+    const native = rn?.NativeModules?.AllStakNative;
+    if (!native) return;
+
+    const release = AllStak.getConfig()?.release ?? '';
+    if (typeof native.install === 'function') {
+      try { await native.install(release); } catch { /* ignore */ }
+    }
+    if (typeof native.drainPendingCrash !== 'function') return;
+
+    const json: string | null = await native.drainPendingCrash();
+    if (!json) return;
+
+    try {
+      const payload = JSON.parse(json);
+      const err = new Error(payload?.message ?? 'Native crash');
+      err.name = payload?.exceptionClass ?? 'NativeCrash';
+      (err as any).stack = Array.isArray(payload?.stackTrace)
+        ? payload.stackTrace.join('\n')
+        : String(payload?.stackTrace ?? '');
+      AllStak.captureException(err, {
+        ...(payload?.metadata || {}),
+        'native.crash': 'true',
+      }, { mechanism: 'native_crash', handled: false });
+    } catch { /* ignore malformed native payload */ }
+  } catch { /* react-native not available */ }
 }
 
 /**
@@ -143,6 +180,10 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
     try { instrumentXmlHttpRequest(); } catch { /* not in JS env */ }
   }
 
+  if (options.autoNativeCrashHandling !== false) {
+    void installAndDrainNativeCrashes();
+  }
+
   if (options.autoFetchBreadcrumbs !== false) {
     try {
       const cfg = AllStak.getConfig();
@@ -176,10 +217,10 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
       const rn = require('react-native');
       const Platform: any = rn?.Platform;
       if (Platform) {
-        AllStak.setTag('device.os', String(Platform.OS ?? ''));
-        AllStak.setTag('device.osVersion', String(Platform.Version ?? ''));
+        AllStak.setTag('device_os', String(Platform.OS ?? ''));
+        AllStak.setTag('device_os_version', String(Platform.Version ?? ''));
         if (Platform.constants?.Model) {
-          AllStak.setTag('device.model', String(Platform.constants.Model));
+          AllStak.setTag('device_model', String(Platform.constants.Model));
         }
       }
     } catch { /* not running under RN */ }
@@ -209,7 +250,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
           AllStak.captureException(error, {
             source: 'react-native-ErrorUtils',
             fatal: String(Boolean(isFatal)),
-          });
+          }, { mechanism: 'onerror', handled: false });
         } catch { /* never break */ }
         try { prev(error, isFatal); } catch { /* ignore */ }
       });
@@ -223,7 +264,8 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
         : new Error(`Unhandled promise rejection: ${String(rejection)}`);
 
     const ship = (err: Error) => {
-      try { AllStak.captureException(err, { source: 'unhandledRejection' }); }
+      try { AllStak.captureException(err, { source: 'unhandledRejection' },
+        { mechanism: 'onunhandledrejection', handled: false }); }
       catch { /* ignore */ }
     };
 

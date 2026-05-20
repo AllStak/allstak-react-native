@@ -3,7 +3,7 @@
  *
  * Mirrors the props the wizard emits (`captureScreenshotOnError`,
  * `screenshotRedaction`, etc.) and orchestrates native capture via the
- * optional `react-native-view-shot` peer dep.
+ * the SDK-owned native module.
  *
  * Fail-open contract: the event MUST always send even when capture is
  * unavailable, throws, times out, or the upload fails. The capture
@@ -19,7 +19,7 @@ declare const __DEV__: boolean | undefined;
 export type ScreenshotRedactionMode = 'strict' | 'balanced' | 'custom';
 export type ScreenshotMaskStyle = 'solid' | 'blur';
 export type ScreenshotFormat = 'png' | 'jpg' | 'webp';
-export type ScreenshotNativeMode = 'auto' | 'view-shot' | 'disabled';
+export type ScreenshotNativeMode = 'auto' | 'native' | 'disabled';
 export type ScreenshotFailPolicy = 'disable-screenshot' | 'send-event-only';
 
 export interface ScreenshotConfig {
@@ -71,17 +71,17 @@ export interface ScreenshotMetadata {
 }
 
 export const DEFAULT_SCREENSHOT_CONFIG: ScreenshotConfig = {
-  captureScreenshotOnError: false,
+  captureScreenshotOnError: true,
   screenshotRedaction: 'strict',
   screenshotMaskStyle: 'solid',
   screenshotMaxBytes: 500_000,
-  screenshotQuality: 0.7,
+  screenshotQuality: 0.6,
   screenshotFormat: 'jpg',
   screenshotSampleRate: 1,
-  screenshotOnUnhandledOnly: true,
+  screenshotOnUnhandledOnly: false,
   screenshotUploadTimeoutMs: 8000,
   screenshotCaptureTimeoutMs: 2000,
-  screenshotNativeMode: 'auto',
+  screenshotNativeMode: 'native',
   screenshotFailPolicy: 'send-event-only',
 };
 
@@ -133,30 +133,34 @@ export function warnIfBothApisPresent(callbackPresent: boolean, flatPresent: boo
   );
 }
 
-// Detect whether view-shot is available without importing it.
-export function isViewShotAvailable(): boolean {
-  return tryRequire('react-native-view-shot') !== null;
+function getAllStakNative(): any | null {
+  try {
+    const RN: any = tryRequire('react-native');
+    return RN?.NativeModules?.AllStakNative ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function isNativeScreenshotAvailable(): boolean {
+  const native = getAllStakNative();
+  return typeof native?.captureScreenshot === 'function';
 }
 
 /**
- * Attempt a native screenshot via react-native-view-shot. Returns
- * `null` if anything goes wrong (timeout, missing dep, no root ref).
+ * Attempt a native screenshot via the SDK-owned native module. Returns
+ * `null` if anything goes wrong (timeout, missing module, unsupported host).
  * Never throws. Toggles `__setCapturing(true)` for the duration of the
  * capture so masking primitives swap to their placeholder render.
  */
-export async function captureViaViewShot(
+export async function captureViaNativeModule(
   config: ScreenshotConfig,
 ): Promise<ScreenshotUpload | null> {
   if (config.screenshotNativeMode === 'disabled') return null;
-  const viewShot: any = tryRequire('react-native-view-shot');
-  if (!viewShot) return null;
-  const captureRef = viewShot.captureRef ?? viewShot.default?.captureRef;
-  if (typeof captureRef !== 'function') return null;
-  const refTarget = rootViewRef?.current;
-  if (!refTarget) return null;
+  const native = getAllStakNative();
+  if (typeof native?.captureScreenshot !== 'function') return null;
 
   const format = config.screenshotFormat === 'jpg' ? 'jpg' : config.screenshotFormat;
-  const dimensions = readDimensions();
 
   __setCapturing(true);
   // Yield one tick so masking primitives can re-render with isCapturing=true.
@@ -164,15 +168,17 @@ export async function captureViaViewShot(
 
   try {
     const captured = await Promise.race([
-      Promise.resolve(captureRef(refTarget, {
+      Promise.resolve(native.captureScreenshot({
         format,
         quality: config.screenshotQuality,
-        result: 'base64',
+        maxBytes: config.screenshotMaxBytes,
       })),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), config.screenshotCaptureTimeoutMs)),
     ]);
-    if (!captured || typeof captured !== 'string') return null;
-    const sizeBytes = estimateBase64Size(captured);
+    if (!captured || typeof captured.dataBase64 !== 'string') return null;
+    const sizeBytes = typeof captured.sizeBytes === 'number'
+      ? captured.sizeBytes
+      : estimateBase64Size(captured.dataBase64);
     if (sizeBytes > config.screenshotMaxBytes) {
       if (__DEV__) {
         // eslint-disable-next-line no-console
@@ -180,18 +186,21 @@ export async function captureViaViewShot(
       }
       return null;
     }
-    const contentType = format === 'png' ? 'image/png' : format === 'webp' ? 'image/webp' : 'image/jpeg';
+    const dimensions = readDimensions();
+    const contentType = typeof captured.contentType === 'string'
+      ? captured.contentType
+      : format === 'png' ? 'image/png' : format === 'webp' ? 'image/webp' : 'image/jpeg';
     return {
-      dataBase64: captured,
+      dataBase64: captured.dataBase64,
       contentType,
-      width: dimensions.width,
-      height: dimensions.height,
+      width: typeof captured.width === 'number' ? captured.width : dimensions.width,
+      height: typeof captured.height === 'number' ? captured.height : dimensions.height,
       sizeBytes,
     };
   } catch (err) {
     if (__DEV__) {
       // eslint-disable-next-line no-console
-      console.warn('[AllStak] view-shot capture failed:', (err as Error)?.message);
+      console.warn('[AllStak] native screenshot capture failed:', (err as Error)?.message);
     }
     return null;
   } finally {
@@ -243,11 +252,11 @@ export async function maybeCaptureScreenshot(
       } catch { return null; }
     }
 
-    const upload = await captureViaViewShot(config);
+    const upload = await captureViaNativeModule(config);
     if (!upload) return null;
 
     const metadata: ScreenshotMetadata = {
-      captureMethod: 'react-native-view-shot',
+      captureMethod: 'allstak-native',
       redactionMode: config.screenshotRedaction,
       maskStyle: config.screenshotMaskStyle,
       format: config.screenshotFormat,

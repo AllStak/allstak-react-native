@@ -32,6 +32,10 @@ Object.defineProperty(globalThis, 'fetch', { value: baseFetch, writable: true, c
 const { AllStak, installReactNative, instrumentReactNavigation, instrumentNavigationFromLinking } =
   await import('../dist/index.mjs');
 
+const errorBodies = () => sent
+  .filter((s) => /\/ingest\/v1\/errors$/.test(s.url))
+  .map((s) => JSON.parse(s.init.body));
+
 // ───────────────────────────────────────────────────────────────
 // setLevel + setFingerprint
 // ───────────────────────────────────────────────────────────────
@@ -51,7 +55,7 @@ test('setFingerprint propagates to payload.fingerprint', async () => {
   AllStak.setFingerprint(['feature-checkout', 'v2']);
   AllStak.captureException(new Error('group-me'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   assert.deepEqual(body.fingerprint, ['feature-checkout', 'v2']);
 });
 
@@ -62,7 +66,7 @@ test('setFingerprint(null) clears the fingerprint', async () => {
   AllStak.setFingerprint(null);
   AllStak.captureException(new Error('cleared'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   assert.equal(body.fingerprint, undefined);
 });
 
@@ -87,7 +91,7 @@ test('installReactNative wraps fetch — successful request adds an http breadcr
   // Trigger a capture to flush the breadcrumb buffer into a payload.
   AllStak.captureException(new Error('after-fetch'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   assert.ok(Array.isArray(body.breadcrumbs), 'breadcrumbs must be present');
   const httpCrumb = body.breadcrumbs.find((c) => c.type === 'http');
   assert.ok(httpCrumb, 'an http breadcrumb must have been recorded');
@@ -110,7 +114,7 @@ test('instrumentFetch records breadcrumb + rethrows on failure', async () => {
 
   AllStak.captureException(new Error('after-failed-fetch'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   const failCrumb = body.breadcrumbs.find((c) => c.type === 'http' && /failed$/.test(c.message));
   assert.ok(failCrumb, 'failed-fetch breadcrumb must be recorded');
   assert.equal(failCrumb.level, 'error');
@@ -126,7 +130,7 @@ test('instrumentFetch skips own-ingest URLs (no recursion)', async () => {
   });
   AllStak.captureException(new Error('one'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   // The capture itself triggered a fetch to api.allstak.sa — it must NOT
   // appear as an http breadcrumb (the previous capture cleared crumbs).
   if (body.breadcrumbs) {
@@ -169,7 +173,7 @@ test('instrumentConsole records warn/error breadcrumbs and forwards to console',
 
   AllStak.captureException(new Error('after-logs'));
   await new Promise((r) => setTimeout(r, 50));
-  const body = JSON.parse(sent[0].init.body);
+  const body = errorBodies()[0];
   const logCrumbs = body.breadcrumbs.filter((c) => c.type === 'log');
   assert.equal(logCrumbs.length, 2);
   assert.equal(logCrumbs[0].level, 'warn');
@@ -248,6 +252,55 @@ test('drainPendingNativeCrashes parses native payload and captures it', async ()
   assert.equal(body.exceptionClass, 'NSException');
   assert.equal(body.metadata['native.crash'], 'true');
   assert.equal(body.metadata.thread, 'main');
+});
+
+test('installReactNative automatically installs and drains linked native crashes', async () => {
+  const previousRequire = globalThis.require;
+  const nativeCalls = [];
+  globalThis.require = (id) => {
+    if (id === 'react-native') {
+      return {
+        NativeModules: {
+          AllStakNative: {
+            install: async (release) => { nativeCalls.push(['install', release]); },
+            drainPendingCrash: async () => JSON.stringify({
+              exceptionClass: 'NativeAutoCrash',
+              message: 'auto drained native crash',
+              stackTrace: ['0  App  0x123'],
+              metadata: { source: 'native-auto' },
+            }),
+          },
+        },
+      };
+    }
+    throw new Error(`module not found: ${id}`);
+  };
+
+  try {
+    sent.length = 0;
+    AllStak.init({ apiKey: 'k', release: 'mobile@2.0.0' });
+    installReactNative({
+      autoErrorHandler: false,
+      autoPromiseRejections: false,
+      autoDeviceTags: false,
+      autoAppStateBreadcrumbs: false,
+      autoNetworkCapture: false,
+      autoFetchBreadcrumbs: false,
+      autoConsoleBreadcrumbs: false,
+      autoNavigationBreadcrumbs: false,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.deepEqual(nativeCalls, [['install', 'mobile@2.0.0']]);
+    const body = errorBodies()[0];
+    assert.equal(body.exceptionClass, 'NativeAutoCrash');
+    assert.equal(body.message, 'auto drained native crash');
+    assert.equal(body.metadata['native.crash'], 'true');
+    assert.equal(body.metadata.source, 'native-auto');
+  } finally {
+    if (previousRequire) globalThis.require = previousRequire;
+    else delete globalThis.require;
+  }
 });
 
 test('drainPendingNativeCrashes is a no-op when no native module is present', async () => {

@@ -25,6 +25,16 @@ test('AllStakProvider is exported as a function', () => {
   assert.equal(typeof mod.AllStakProvider, 'function');
 });
 
+test('top-level init and wrap are exported', () => {
+  assert.equal(typeof mod.init, 'function');
+  assert.equal(typeof mod.wrap, 'function');
+  assert.equal(typeof mod.AllStak.wrap, 'function');
+  assert.equal(typeof mod.captureException, 'function');
+  assert.equal(typeof mod.captureMessage, 'function');
+  assert.equal(typeof mod.log, 'function');
+  assert.equal(typeof mod.logger.info, 'function');
+});
+
 test('useAllStak is exported as a function', () => {
   assert.equal(typeof mod.useAllStak, 'function');
 });

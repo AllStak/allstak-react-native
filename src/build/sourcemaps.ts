@@ -24,11 +24,10 @@
  *     sourcemap: 'ios.bundle.map',
  *     release: 'mobile@1.2.3',
  *     dist: 'ios-hermes',
- *     token: process.env.ALLSTAK_UPLOAD_TOKEN,
  *   });
  *
  * Or `injectOnly: true` to add the debug-id without uploading (useful in
- * CI dry-runs or when you don't have an upload token yet).
+ * CI dry-runs or when no build-only upload token is available).
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -53,7 +52,7 @@ export interface UploadReactNativeSourcemapOptions {
    * pick the right map per platform.
    */
   dist?: string;
-  /** Project upload token (`aspk_…`). Defaults to `ALLSTAK_UPLOAD_TOKEN`. */
+  /** Optional build-only upload credential. Defaults to ALLSTAK_UPLOAD_TOKEN. */
   token?: string;
   /** Override ingest host. Defaults to `ALLSTAK_HOST` or production. */
   host?: string;
@@ -147,7 +146,10 @@ async function uploadOne(
 
   const res = await fetch(host.replace(/\/$/, '') + '/api/v1/artifacts/upload', {
     method: 'POST',
-    headers: { 'X-AllStak-Upload-Token': token },
+    headers: {
+      'X-AllStak-Upload-Token': token,
+      'X-AllStak-Key': token,
+    },
     body: form,
   });
   return { status: res.status, body: await res.text(), ok: res.ok };
@@ -170,7 +172,7 @@ export async function uploadReactNativeSourcemap(
   const token = opts.token ?? process.env.ALLSTAK_UPLOAD_TOKEN;
   if (opts.injectOnly || !token) {
     if (!opts.injectOnly && !token) {
-      log('skipping upload — no token (set ALLSTAK_UPLOAD_TOKEN or pass `token`)');
+      log('skipping upload — no build-only upload token found');
     }
     return inject;
   }

@@ -159,6 +159,135 @@ test('uploadReactNativeSourcemap with uploadBundle:true sends both map AND bundl
   }
 });
 
+test('uploadReactNativeSourcemap uses ALLSTAK_UPLOAD_TOKEN from env', async () => {
+  const dir = freshDir();
+  const recorded = [];
+  const realFetch = globalThis.fetch;
+  const oldUpload = process.env.ALLSTAK_UPLOAD_TOKEN;
+  const oldApi = process.env.ALLSTAK_API_KEY;
+  const oldExpoApi = process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+  globalThis.fetch = async (_url, init) => {
+    recorded.push({ headers: init?.headers });
+    return new Response('{}', { status: 201 });
+  };
+  process.env.ALLSTAK_UPLOAD_TOKEN = 'aspk_upload_test';
+  process.env.ALLSTAK_API_KEY = 'ask_test';
+  process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = 'ask_public_test';
+  try {
+    const { bundle, sourcemap } = writeBundlePair(dir);
+    const result = await sm.uploadReactNativeSourcemap({
+      bundle, sourcemap, release: 'mobile@1.2.3',
+      host: 'http://localhost:8080', silent: true,
+    });
+    assert.equal(result.uploaded, true);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].headers['X-AllStak-Upload-Token'], 'aspk_upload_test');
+    assert.equal(recorded[0].headers['X-AllStak-Key'], 'aspk_upload_test');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (oldUpload === undefined) delete process.env.ALLSTAK_UPLOAD_TOKEN;
+    else process.env.ALLSTAK_UPLOAD_TOKEN = oldUpload;
+    if (oldApi === undefined) delete process.env.ALLSTAK_API_KEY;
+    else process.env.ALLSTAK_API_KEY = oldApi;
+    if (oldExpoApi === undefined) delete process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+    else process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = oldExpoApi;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('uploadReactNativeSourcemap does not reuse runtime API keys for source-map upload', async () => {
+  const dir = freshDir();
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  const oldUpload = process.env.ALLSTAK_UPLOAD_TOKEN;
+  const oldApi = process.env.ALLSTAK_API_KEY;
+  const oldExpoApi = process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+  globalThis.fetch = async () => { calls += 1; return new Response('{}', { status: 201 }); };
+  delete process.env.ALLSTAK_UPLOAD_TOKEN;
+  process.env.ALLSTAK_API_KEY = 'ask_test';
+  process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = 'ask_public_test';
+  try {
+    const { bundle, sourcemap } = writeBundlePair(dir);
+    const result = await sm.uploadReactNativeSourcemap({
+      bundle, sourcemap, release: 'mobile@1.2.3',
+      host: 'http://localhost:8080', silent: true,
+    });
+    assert.equal(result.uploaded, undefined);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (oldUpload === undefined) delete process.env.ALLSTAK_UPLOAD_TOKEN;
+    else process.env.ALLSTAK_UPLOAD_TOKEN = oldUpload;
+    if (oldApi === undefined) delete process.env.ALLSTAK_API_KEY;
+    else process.env.ALLSTAK_API_KEY = oldApi;
+    if (oldExpoApi === undefined) delete process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+    else process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = oldExpoApi;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('uploadReactNativeSourcemap skips upload when only public Expo runtime key is set', async () => {
+  const dir = freshDir();
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  const oldUpload = process.env.ALLSTAK_UPLOAD_TOKEN;
+  const oldApi = process.env.ALLSTAK_API_KEY;
+  const oldExpoApi = process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+  globalThis.fetch = async () => { calls += 1; return new Response('{}', { status: 201 }); };
+  delete process.env.ALLSTAK_UPLOAD_TOKEN;
+  delete process.env.ALLSTAK_API_KEY;
+  process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = 'ask_public_test';
+  try {
+    const { bundle, sourcemap } = writeBundlePair(dir);
+    const result = await sm.uploadReactNativeSourcemap({
+      bundle, sourcemap, release: 'mobile@1.2.3',
+      host: 'http://localhost:8080', silent: true,
+    });
+    assert.equal(result.uploaded, undefined);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (oldUpload === undefined) delete process.env.ALLSTAK_UPLOAD_TOKEN;
+    else process.env.ALLSTAK_UPLOAD_TOKEN = oldUpload;
+    if (oldApi === undefined) delete process.env.ALLSTAK_API_KEY;
+    else process.env.ALLSTAK_API_KEY = oldApi;
+    if (oldExpoApi === undefined) delete process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+    else process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = oldExpoApi;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('uploadReactNativeSourcemap silently skips when no build-only upload token is provided', async () => {
+  const dir = freshDir();
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  const oldUpload = process.env.ALLSTAK_UPLOAD_TOKEN;
+  const oldApi = process.env.ALLSTAK_API_KEY;
+  const oldExpoApi = process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+  globalThis.fetch = async () => { calls += 1; return new Response('{}', { status: 201 }); };
+  delete process.env.ALLSTAK_UPLOAD_TOKEN;
+  delete process.env.ALLSTAK_API_KEY;
+  delete process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+  try {
+    const { bundle, sourcemap } = writeBundlePair(dir);
+    const result = await sm.uploadReactNativeSourcemap({
+      bundle, sourcemap, release: 'mobile@1.2.3',
+      host: 'http://localhost:8080', silent: true,
+    });
+    assert.equal(result.uploaded, undefined);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (oldUpload === undefined) delete process.env.ALLSTAK_UPLOAD_TOKEN;
+    else process.env.ALLSTAK_UPLOAD_TOKEN = oldUpload;
+    if (oldApi === undefined) delete process.env.ALLSTAK_API_KEY;
+    else process.env.ALLSTAK_API_KEY = oldApi;
+    if (oldExpoApi === undefined) delete process.env.EXPO_PUBLIC_ALLSTAK_API_KEY;
+    else process.env.EXPO_PUBLIC_ALLSTAK_API_KEY = oldExpoApi;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('uploadReactNativeSourcemap with injectOnly:true skips upload', async () => {
   const dir = freshDir();
   let calls = 0;
@@ -174,26 +303,6 @@ test('uploadReactNativeSourcemap with injectOnly:true skips upload', async () =>
     assert.equal(result.uploaded, undefined);
     assert.equal(calls, 0);
     assert.ok(/^[0-9a-f-]{36}$/.test(result.debugId));
-  } finally {
-    globalThis.fetch = realFetch;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('uploadReactNativeSourcemap silently skips when no token is provided', async () => {
-  const dir = freshDir();
-  let calls = 0;
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => { calls += 1; return new Response('{}', { status: 201 }); };
-  delete process.env.ALLSTAK_UPLOAD_TOKEN;
-  try {
-    const { bundle, sourcemap } = writeBundlePair(dir);
-    const result = await sm.uploadReactNativeSourcemap({
-      bundle, sourcemap, release: 'mobile@1.2.3',
-      host: 'http://localhost:8080', silent: true,
-    });
-    assert.equal(result.uploaded, undefined);
-    assert.equal(calls, 0);
   } finally {
     globalThis.fetch = realFetch;
     rmSync(dir, { recursive: true, force: true });

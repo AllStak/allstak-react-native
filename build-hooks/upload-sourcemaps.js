@@ -7,15 +7,9 @@
  * `npx react-native bundle` for both platforms, calls the SDK's
  * uploader, and exits non-zero if any platform's upload fails.
  *
- * Usage in CI / Xcode build phase / Gradle task:
- *
- *   ALLSTAK_RELEASE='mobile@1.2.3+5' \
- *   ALLSTAK_UPLOAD_TOKEN='aspk_…' \
- *     node scripts/upload-sourcemaps.js [path/to/build-output-dir]
- *
  * Env vars consulted:
- *   ALLSTAK_RELEASE       — required, your release identifier
- *   ALLSTAK_UPLOAD_TOKEN  — required, project-scoped upload token
+ *   ALLSTAK_RELEASE       — optional override; otherwise derived from app config when possible
+ *   ALLSTAK_UPLOAD_TOKEN  — build-only source-map upload credential
  *   ALLSTAK_HOST          — optional, defaults to https://api.allstak.sa
  *   ALLSTAK_DIST_OVERRIDE — optional, override auto-detected dist
  *
@@ -25,7 +19,7 @@
  *   3. Conventional names: <platform>.bundle / <platform>.bundle.map
  *
  * Exits:
- *   0  — at least one platform uploaded OK (or injectOnly with no token)
+ *   0  — at least one platform uploaded OK (or injectOnly with no upload token)
  *   1  — required env missing or all platforms failed
  *
  * No deps beyond Node 18+ and the SDK itself.
@@ -38,19 +32,20 @@ const path = require('node:path');
 
 const args = parseArgs(process.argv.slice(2));
 
-const RELEASE = process.env.ALLSTAK_RELEASE;
+const baseDir = path.resolve(args.dir || process.cwd());
+const RELEASE = args.release || process.env.ALLSTAK_RELEASE || resolveRelease(process.cwd()) || resolveRelease(baseDir);
 const TOKEN = process.env.ALLSTAK_UPLOAD_TOKEN;
 const HOST = process.env.ALLSTAK_HOST;
 const DIST_OVERRIDE = process.env.ALLSTAK_DIST_OVERRIDE;
-const INJECT_ONLY = !TOKEN;  // gracefully fall back to inject-only if no token
+const INJECT_ONLY = !TOKEN;  // gracefully fall back to inject-only if no credential
 
 if (!RELEASE) {
-  console.error('[allstak] ALLSTAK_RELEASE env var is required (e.g. "mobile@1.2.3+5")');
+  console.error('[allstak] could not derive release from app config. Set ALLSTAK_RELEASE or pass --release.');
   process.exit(1);
 }
 
 if (INJECT_ONLY && !args.injectOnly) {
-  console.warn('[allstak] no ALLSTAK_UPLOAD_TOKEN — running in inject-only mode (debug-ids written, no upload)');
+  console.warn('[allstak] no build-only upload token found — running in inject-only mode (debug-ids written, no upload)');
 }
 
 (async () => {
@@ -62,8 +57,6 @@ if (INJECT_ONLY && !args.injectOnly) {
     console.error(e?.message ?? e);
     process.exit(1);
   }
-
-  const baseDir = path.resolve(args.dir || process.cwd());
 
   // Targets to try. If --bundle/--sourcemap are supplied, treat that as
   // a single explicit target; otherwise probe both ios + android in the
@@ -138,6 +131,7 @@ function parseArgs(argv) {
     else if (a === '--sourcemap') out.sourcemap = argv[++i];
     else if (a === '--platform')  out.platform = argv[++i];
     else if (a === '--dist')      out.dist = argv[++i];
+    else if (a === '--release')   out.release = argv[++i];
     else if (a === '--inject-only') out.injectOnly = true;
     else if (a === '--strip-sources') out.stripSources = true;
     else if (a === '--upload-bundle') out.uploadBundle = true;
@@ -146,6 +140,27 @@ function parseArgs(argv) {
   }
   if (out._.length > 0 && !out.dir) out.dir = out._[0];
   return out;
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+
+function resolveRelease(root) {
+  const appJson = readJson(path.join(root, 'app.json'));
+  const appConfigJson = readJson(path.join(root, 'app.config.json'));
+  const expo = appConfigJson?.expo ?? appJson?.expo ?? appConfigJson ?? appJson ?? null;
+  if (expo) {
+    const id = expo.ios?.bundleIdentifier ?? expo.android?.package ?? expo.slug ?? expo.name;
+    const version = expo.version;
+    const build = expo.ios?.buildNumber ?? expo.android?.versionCode;
+    if (id && version) return `${id}@${version}${build != null && String(build).length > 0 ? '+' + build : ''}`;
+  }
+
+  const pkg = readJson(path.join(root, 'package.json'));
+  if (pkg?.name && pkg?.version) return `${pkg.name}@${pkg.version}`;
+  return null;
 }
 
 function pickBundle(dir, platform) {

@@ -14,7 +14,7 @@
  *   - masking primitives swap during capture
  *
  * Runs under plain Node — no jsdom, no react-native. We stub `fetch` and
- * mock the view-shot capture path via the lazy-require contract.
+ * mock the native module capture path via the lazy-require contract.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -63,16 +63,16 @@ async function flush(ms = 200) { await new Promise((r) => setTimeout(r, ms)); }
 
 test('resolveScreenshotConfig fills defaults', () => {
   const c = mod.resolveScreenshotConfig({});
-  assert.equal(c.captureScreenshotOnError, false);
+  assert.equal(c.captureScreenshotOnError, true);
   assert.equal(c.screenshotRedaction, 'strict');
   assert.equal(c.screenshotMaskStyle, 'solid');
   assert.equal(c.screenshotMaxBytes, 500000);
   assert.equal(c.screenshotFormat, 'jpg');
   assert.equal(c.screenshotSampleRate, 1);
-  assert.equal(c.screenshotOnUnhandledOnly, true);
+  assert.equal(c.screenshotOnUnhandledOnly, false);
   assert.equal(c.screenshotUploadTimeoutMs, 8000);
   assert.equal(c.screenshotCaptureTimeoutMs, 2000);
-  assert.equal(c.screenshotNativeMode, 'auto');
+  assert.equal(c.screenshotNativeMode, 'native');
   assert.equal(c.screenshotFailPolicy, 'send-event-only');
 });
 
@@ -91,18 +91,20 @@ test('resolveScreenshotConfig clamps out-of-range values', () => {
   assert.equal(c.screenshotUploadTimeoutMs, 500);
 });
 
-test('flat API: screenshots disabled by default → no attachment posted', async () => {
+test('flat API: screenshots are automatic and fail open without native module', async () => {
   resetAll();
   mod.AllStak.init({ apiKey: 'ask_test', host: 'https://api.test' });
   mod.AllStak.captureException(new Error('boom'));
   await flush();
   const attachments = sent.filter((s) => s.url.includes('/attachments'));
-  assert.equal(attachments.length, 0, 'no attachments when captureScreenshotOnError is not set');
+  assert.equal(attachments.length, 0, 'missing native module → no attachment');
   const events = sent.filter((s) => s.url.includes('/ingest/v1/errors') && !s.url.includes('/attachments'));
   assert.ok(events.length >= 1, 'event sent');
+  const body = JSON.parse(events[0].init.body);
+  assert.ok(['unavailable', 'unsupported_runtime'].includes(body.metadata['screenshot.status']));
 });
 
-test('flat API: enabled but view-shot missing → event still sends, no upload, status unavailable', async () => {
+test('flat API: enabled but native screenshot module missing → event still sends, no upload, status unavailable', async () => {
   resetAll();
   mod.AllStak.init({
     apiKey: 'ask_test', host: 'https://api.test',
@@ -112,7 +114,7 @@ test('flat API: enabled but view-shot missing → event still sends, no upload, 
   await flush();
   const events = sent.filter((s) => s.url.includes('/ingest/v1/errors') && !s.url.includes('/attachments'));
   const attachments = sent.filter((s) => s.url.includes('/attachments'));
-  assert.equal(attachments.length, 0, 'view-shot missing → no attachment');
+  assert.equal(attachments.length, 0, 'native screenshot module missing → no attachment');
   assert.ok(events.length >= 1, 'event still sent');
   const body = JSON.parse(events[0].init.body);
   // Status should be 'unavailable' (or 'unsupported_runtime' if expo Go was detected).
@@ -169,8 +171,7 @@ test('flat + callback API both present → flat wins, warn logged once', async (
     // Should have warned once about both APIs.
     const dual = warnings.filter((w) => w.includes('flat') && w.includes('deprecated'));
     assert.ok(dual.length >= 1, 'deprecation warning emitted');
-    // Should still NOT call the callback provider (flat wins, even though it
-    // returns null because view-shot is missing).
+    // Should still NOT call the callback provider; flat wins.
     const attachments = sent.filter((s) => s.url.includes('/attachments'));
     assert.equal(attachments.length, 0);
   } finally {
@@ -184,8 +185,8 @@ test('detectRuntimeMode returns a known mode', () => {
   assert.ok(['expo-go', 'expo-dev-client', 'rn-cli', 'unknown'].includes(m));
 });
 
-test('isViewShotAvailable returns false when peer dep is absent', () => {
-  assert.equal(mod.isViewShotAvailable(), false);
+test('isNativeScreenshotAvailable returns false when native capture API is absent', () => {
+  assert.equal(mod.isNativeScreenshotAvailable(), false);
 });
 
 test('masking primitives are exported as functions', () => {
@@ -204,7 +205,7 @@ test('registerSensitiveRef returns an unregister function', () => {
 });
 
 test('attachment payload shape includes required keys when fully wired', async () => {
-  // Simulate a working view-shot by overriding maybeCaptureScreenshot via
+  // Simulate a working native screenshot by overriding maybeCaptureScreenshot via
   // monkey-patching the screenshot module is hard from outside. Instead,
   // verify the upload pipeline path can be exercised by directly POSTing
   // a synthesized attachment via the documented endpoint shape — i.e.
@@ -217,7 +218,7 @@ test('attachment payload shape includes required keys when fully wired', async (
     width: 390,
     height: 844,
     redactionMode: 'strict',
-    captureMethod: 'react-native-view-shot',
+    captureMethod: 'allstak-native',
     sizeBytes: 3,
     metadata: { maskStyle: 'solid', format: 'jpg', runtimeMode: 'rn-cli' },
   };
