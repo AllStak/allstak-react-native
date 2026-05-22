@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 const apiKey = process.env.ALLSTAK_TEST_API_KEY;
 const targetUrl = process.env.ALLSTAK_MOBILE_CONTRACT_TARGET_URL;
 const verifyUrl = process.env.ALLSTAK_CONTRACT_VERIFY_URL;
-const host = process.env.ALLSTAK_TEST_HOST ?? 'https://api.dev.allstak.sa';
+const host = process.env.ALLSTAK_TEST_HOST ?? 'https://api.allstak.sa';
 const release = process.env.ALLSTAK_TEST_RELEASE ?? `rn-sdk-contract-${Date.now()}`;
 const dist = process.env.ALLSTAK_TEST_DIST ?? 'android-hermes';
 

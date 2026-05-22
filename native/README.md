@@ -1,13 +1,25 @@
-# Native Modules
+# @allstak/react-native native modules
 
-Native modules are included with `@allstak/react-native` and are wired through
-the normal React Native native build process.
+Native crash support is included with `@allstak/react-native`.
 
-Most apps should use the standard setup flow:
+Install the package, add the Expo plugin when using Expo, then rebuild the native app:
 
 ```bash
-npx @allstak/wizard@latest -i reactNative
+npm install @allstak/react-native
 ```
 
-After setup, rebuild the app with your normal React Native, Expo dev client, or
-native CI workflow.
+```json
+{
+  "expo": {
+    "plugins": ["@allstak/react-native"]
+  }
+}
+```
+
+```bash
+npx expo prebuild
+npx expo run:ios
+npx expo run:android
+```
+
+Bare React Native apps should rebuild iOS and Android after package installation so native crash handlers are linked.

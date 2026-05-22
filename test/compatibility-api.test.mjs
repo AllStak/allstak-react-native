@@ -115,6 +115,80 @@ test('setContext(name, null) removes a context bag', async () => {
   assert.equal(meta['context.app'], undefined);
 });
 
+test('event processors can mutate or drop events', async () => {
+  sent.length = 0;
+  AllStak.init({
+    apiKey: 'k',
+    eventProcessors: [
+      (event) => ({ ...event, message: `processed:${event.message}` }),
+      (event) => event.message.includes('drop-me') ? null : event,
+    ],
+  });
+  AllStak.captureException(new Error('keep-me'));
+  AllStak.captureException(new Error('drop-me'));
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.parse(sent[0].init.body).message, 'processed:keep-me');
+});
+
+test('addEventProcessor registers a runtime processor', async () => {
+  sent.length = 0;
+  AllStak.init({ apiKey: 'k' });
+  AllStak.addEventProcessor((event) => ({
+    ...event,
+    metadata: { ...(event.metadata ?? {}), runtimeProcessor: true },
+  }));
+  AllStak.captureException(new Error('runtime-processor'));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(JSON.parse(sent[0].init.body).metadata.runtimeProcessor, true);
+});
+
+test('ignoreErrors, allowUrls, and denyUrls filter error events', async () => {
+  sent.length = 0;
+  AllStak.init({
+    apiKey: 'k',
+    ignoreErrors: [/ignore-this/],
+    allowUrls: [/\/allowed\.js/],
+    denyUrls: [/\/blocked\.js/],
+  });
+
+  const ignored = new Error('ignore-this');
+  ignored.stack = 'Error: ignore-this\n    at ignored (https://cdn.example.com/allowed.js:1:1)';
+  const denied = new Error('denied');
+  denied.stack = 'Error: denied\n    at denied (https://cdn.example.com/blocked.js:1:1)';
+  const disallowed = new Error('disallowed');
+  disallowed.stack = 'Error: disallowed\n    at disallowed (https://cdn.example.com/other.js:1:1)';
+  const allowed = new Error('allowed');
+  allowed.stack = 'Error: allowed\n    at allowed (https://cdn.example.com/allowed.js:1:1)';
+
+  AllStak.captureException(ignored);
+  AllStak.captureException(denied);
+  AllStak.captureException(disallowed);
+  AllStak.captureException(allowed);
+  await new Promise((r) => setTimeout(r, 80));
+
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.parse(sent[0].init.body).message, 'allowed');
+});
+
+test('dedupe drops consecutive duplicate events and can be disabled', async () => {
+  sent.length = 0;
+  AllStak.init({ apiKey: 'k' });
+  const error = new Error('dupe');
+  AllStak.captureException(error);
+  AllStak.captureException(error);
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(sent.length, 1);
+
+  sent.length = 0;
+  AllStak.init({ apiKey: 'k', dedupe: false });
+  const optOutError = new Error('dupe');
+  AllStak.captureException(optOutError);
+  AllStak.captureException(optOutError);
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(sent.length, 2);
+});
+
 test('flush() resolves true when buffer is empty', async () => {
   AllStak.init({ apiKey: 'k' });
   const ok = await AllStak.flush(500);

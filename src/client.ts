@@ -46,6 +46,13 @@ import {
   type SanitizedHttpRequest,
 } from './mechanism';
 
+interface AsyncScopeStorage {
+  getStore(): Scope[] | undefined;
+  run<T>(store: Scope[], callback: () => T): T;
+}
+
+declare const require: undefined | ((id: string) => { AsyncLocalStorage?: new () => AsyncScopeStorage });
+
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
 export const SDK_VERSION = '0.5.9';
@@ -62,10 +69,20 @@ const SDK_LOAD_TIME = Date.now();
 const VALID_BREADCRUMB_TYPES = new Set(['http', 'log', 'ui', 'navigation', 'query', 'default']);
 const VALID_BREADCRUMB_LEVELS = new Set(['fatal', 'error', 'warning', 'warn', 'log', 'info', 'debug']);
 const DEFAULT_MAX_BREADCRUMBS = 100;
+const DEFAULT_IGNORE_ERRORS: EventFilterPattern[] = [
+  /^Script error\.?$/i,
+  /ResizeObserver loop limit exceeded/i,
+  /ResizeObserver loop completed with undelivered notifications/i,
+  /^Non-Error promise rejection captured with value: (?:null|undefined)$/i,
+];
 
 export type SeverityLevel = Severity;
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'warning' | 'error' | 'fatal';
 export type EventId = string;
+type EventFilterPattern = string | RegExp;
+export type ErrorEventProcessor = (
+  event: ErrorIngestPayload,
+) => ErrorIngestPayload | null | undefined | Promise<ErrorIngestPayload | null | undefined>;
 
 export interface LogEnvelope {
   level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -101,7 +118,7 @@ export interface AllStakConfig {
   fingerprint?: string[];
   /** Probability in [0, 1] that any new span is recorded. Default 1. */
   tracesSampleRate?: number;
-  /** Master switch for Sentry-style performance spans. Default: true. */
+  /** Master switch for namespace-compatible performance spans. Default: true. */
   enablePerformance?: boolean;
   /** Mutate or drop a performance span before it leaves the SDK. */
   beforeSendSpan?: (span: SpanData) => SpanData | null | undefined;
@@ -164,6 +181,14 @@ export interface AllStakConfig {
   beforeSend?: (event: ErrorIngestPayload) =>
     | ErrorIngestPayload | null | undefined
     | Promise<ErrorIngestPayload | null | undefined>;
+  /** namespace-compatible event processors. Return null/undefined to drop. */
+  eventProcessors?: ErrorEventProcessor[];
+  /** Drop errors whose message/class matches any pattern. */
+  ignoreErrors?: EventFilterPattern[];
+  /** Disable built-in browser-noise ignores. Default: false. */
+  disableDefaultIgnoreErrors?: boolean;
+  /** Drop consecutive duplicate errors/messages. Default: true. */
+  dedupe?: boolean;
   /**
    * Optional legacy provider-based screenshot capture. Prefer the flat
    * screenshot options below; the SDK-owned native capture path is enabled
@@ -341,6 +366,20 @@ function generateId(): string {
   return `${seg(8)}-${seg(4)}-4${seg(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${seg(3)}-${seg(12)}`;
 }
 
+function createAsyncScopeStorage(): AsyncScopeStorage | null {
+  const proc = (globalThis as any).process;
+  if (!proc?.versions?.node) return null;
+  try {
+    const fromProcess = proc.getBuiltinModule?.('node:async_hooks')?.AsyncLocalStorage;
+    if (fromProcess) return new fromProcess();
+    const req = typeof require === 'function' ? require : undefined;
+    const AsyncLocalStorage = req?.('node:async_hooks').AsyncLocalStorage;
+    return AsyncLocalStorage ? new AsyncLocalStorage() : null;
+  } catch {
+    return null;
+  }
+}
+
 function stringContextValue(context: Record<string, unknown>, key: string): string | undefined {
   const value = context[key];
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
@@ -378,6 +417,33 @@ function normalizeLogLevel(level: LogLevel): 'trace' | 'debug' | 'info' | 'warn'
   return level === 'warning' ? 'warn' : level;
 }
 
+function matchesPattern(value: string | undefined, pattern: EventFilterPattern): boolean {
+  if (!value) return false;
+  return typeof pattern === 'string' ? value.includes(pattern) : pattern.test(value);
+}
+
+function eventUrls(event: ErrorIngestPayload): string[] {
+  const urls = new Set<string>();
+  for (const frame of event.frames ?? []) {
+    if (frame.filename && /^https?:\/\//i.test(frame.filename)) urls.add(frame.filename);
+    if (frame.absPath && /^https?:\/\//i.test(frame.absPath)) urls.add(frame.absPath);
+  }
+  for (const line of event.stackTrace ?? []) {
+    const match = line.match(/https?:\/\/[^\s)]+/i);
+    if (match) urls.add(match[0]);
+  }
+  if (event.request?.url_sanitized && /^https?:\/\//i.test(event.request.url_sanitized)) urls.add(event.request.url_sanitized);
+  return [...urls];
+}
+
+function eventDedupeKey(event: ErrorIngestPayload): string {
+  const fingerprint = event.fingerprint?.join('|') ?? '';
+  const firstFrame = event.frames?.[0]
+    ? `${event.frames[0].filename ?? event.frames[0].absPath ?? ''}:${event.frames[0].lineno ?? ''}:${event.frames[0].colno ?? ''}:${event.frames[0].function ?? ''}`
+    : event.stackTrace?.[0] ?? '';
+  return [event.exceptionClass, event.message, fingerprint, firstFrame].join('|');
+}
+
 function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -388,7 +454,8 @@ export class AllStakClient {
   private sessionId: string;
   private breadcrumbs: Breadcrumb[] = [];
   private maxBreadcrumbs: number;
-  private scopeStack: Scope[] = [];
+  private globalScopeStack: Scope[] = [];
+  private asyncScopeStorage: AsyncScopeStorage | null = createAsyncScopeStorage();
   private tracing: TracingModule;
   private replay: ReplaySurrogate | null = null;
   private httpRequests: HttpRequestModule | null = null;
@@ -401,6 +468,8 @@ export class AllStakClient {
   private autoTags: Record<string, string> = {};
   /** Current screen / transaction name — set via setCurrentScreen() or nav auto-instrument. */
   private currentTransaction: string | null = null;
+  private eventProcessors: ErrorEventProcessor[] = [];
+  private lastEventKey: string | null = null;
 
   constructor(config: AllStakConfig) {
     this.config = { ...config };
@@ -714,11 +783,7 @@ export class AllStakClient {
     // Send the event once. If no screenshot was captured there is no
     // attachment to link, so keep the normal transport path for buffering,
     // circuit-breaker accounting, and fail-open behavior.
-    let finalPayload: ErrorIngestPayload | null | undefined = eventPayload;
-    if (this.config.beforeSend) {
-      try { finalPayload = await this.config.beforeSend(eventPayload); }
-      catch { finalPayload = eventPayload; }
-    }
+    let finalPayload: ErrorIngestPayload | null | undefined = await this.applyEventPipeline(eventPayload);
     if (!finalPayload) return;
 
     if (!captured || !this.transport.isEnabled()) {
@@ -951,6 +1016,11 @@ export class AllStakClient {
     Object.assign(this.config.extras, extras);
   }
 
+  /** Register a namespace-compatible event processor. */
+  addEventProcessor(processor: ErrorEventProcessor): void {
+    this.eventProcessors.push(processor);
+  }
+
   /**
    * Attach a named context bag (e.g. `app`, `device`, `runtime`) — appears
    * under `metadata['context.<name>']` on every subsequent event. Pass
@@ -963,10 +1033,12 @@ export class AllStakClient {
   }
 
   /**
-   * Wait for the in-flight retry-buffer to drain. Resolves `true` if the
-   * buffer empties within `timeoutMs` (default 2000ms), `false` otherwise.
+   * Flush queued span batches and wait for in-flight transport work to drain.
+   * Resolves `true` if telemetry drains within `timeoutMs` (default 2000ms),
+   * `false` otherwise.
    */
   flush(timeoutMs?: number): Promise<boolean> {
+    this.tracing.flush();
     return this.transport.flush(timeoutMs);
   }
 
@@ -1005,6 +1077,8 @@ export class AllStakClient {
     unbindHttpInstrumentation();
     this._instrumentAxios = null;
     this.breadcrumbs = [];
+    this.eventProcessors = [];
+    this.lastEventKey = null;
   }
 
   private captureAppStartSpan(): void {
@@ -1290,7 +1364,11 @@ export class AllStakClient {
    * payload without leaking out of the callback.
    */
   private effective(): AllStakConfig {
-    return mergeScopes(this.config, this.scopeStack);
+    return mergeScopes(this.config, this.scopeStack());
+  }
+
+  private scopeStack(): Scope[] {
+    return this.asyncScopeStorage?.getStore() ?? this.globalScopeStack;
   }
 
   private buildMetadata(perCallContext?: Record<string, unknown>): Record<string, unknown> {
@@ -1320,9 +1398,14 @@ export class AllStakClient {
    */
   withScope<T>(callback: (scope: Scope) => T): T {
     const scope = new Scope();
-    this.scopeStack.push(scope);
+    if (this.asyncScopeStorage) {
+      const parent = this.scopeStack();
+      return this.asyncScopeStorage.run([...parent, scope], () => callback(scope));
+    }
+
+    this.globalScopeStack.push(scope);
     let popped = false;
-    const pop = () => { if (!popped) { popped = true; this.scopeStack.pop(); } };
+    const pop = () => { if (!popped) { popped = true; this.globalScopeStack.pop(); } };
     try {
       const result = callback(scope);
       if (result && typeof (result as any).then === 'function') {
@@ -1341,17 +1424,75 @@ export class AllStakClient {
 
   /** Direct access to the topmost active scope, or null. @internal */
   getCurrentScope(): Scope | null {
-    return this.scopeStack[this.scopeStack.length - 1] ?? null;
+    const stack = this.scopeStack();
+    return stack[stack.length - 1] ?? null;
+  }
+
+  configureScope(callback: (scope: Scope) => void): void {
+    const current = this.getCurrentScope();
+    if (current) {
+      callback(current);
+      return;
+    }
+    const scope = new Scope();
+    callback(scope);
+    const eff = mergeScopes(this.config, [scope]);
+    this.config.user = eff.user;
+    this.config.tags = eff.tags;
+    this.config.extras = eff.extras;
+    this.config.contexts = eff.contexts;
+    this.config.fingerprint = eff.fingerprint;
+    this.config.level = eff.level;
   }
 
   private async sendThroughBeforeSend(payload: ErrorIngestPayload): Promise<void> {
-    let final: ErrorIngestPayload | null | undefined = payload;
-    if (this.config.beforeSend) {
-      try { final = await this.config.beforeSend(payload); }
-      catch { final = payload; /* never let a buggy hook drop telemetry */ }
-    }
+    const final = await this.applyEventPipeline(payload);
     if (!final) return;
     this.transport.send(ERRORS_PATH, final);
+  }
+
+  private async applyEventPipeline(payload: ErrorIngestPayload): Promise<ErrorIngestPayload | null | undefined> {
+    let final: ErrorIngestPayload | null | undefined = payload;
+    for (const processor of [...(this.config.eventProcessors ?? []), ...this.eventProcessors]) {
+      if (!final) return null;
+      try { final = await processor(final); }
+      catch { /* never let a buggy processor break capture */ }
+    }
+    if (!final || this.shouldDropByFilters(final)) return;
+    if (this.config.beforeSend) {
+      try { final = await this.config.beforeSend(final); }
+      catch { final = payload; /* never let a buggy hook drop telemetry */ }
+    }
+    if (!final || this.shouldDropDuplicate(final)) return;
+    return final;
+  }
+
+  private shouldDropByFilters(event: ErrorIngestPayload): boolean {
+    const ignorePatterns = this.config.disableDefaultIgnoreErrors
+      ? (this.config.ignoreErrors ?? [])
+      : [...DEFAULT_IGNORE_ERRORS, ...(this.config.ignoreErrors ?? [])];
+    const message = `${event.exceptionClass || ''}: ${event.message || ''}`;
+    if (ignorePatterns.some((pattern) => matchesPattern(message, pattern) || matchesPattern(event.message, pattern))) {
+      return true;
+    }
+
+    const urls = eventUrls(event);
+    if (this.config.allowUrls?.length && urls.length > 0 &&
+        !urls.some((url) => this.config.allowUrls!.some((pattern) => matchesPattern(url, pattern)))) {
+      return true;
+    }
+    if (this.config.denyUrls?.length && urls.some((url) => this.config.denyUrls!.some((pattern) => matchesPattern(url, pattern)))) {
+      return true;
+    }
+    return false;
+  }
+
+  private shouldDropDuplicate(event: ErrorIngestPayload): boolean {
+    if (this.config.dedupe === false) return false;
+    const key = eventDedupeKey(event);
+    if (key && key === this.lastEventKey) return true;
+    this.lastEventKey = key;
+    return false;
   }
 
   private releaseTags(): Record<string, unknown> {
@@ -1449,6 +1590,7 @@ export const AllStak: any = {
   setTags(tags: Record<string, string>): void { try { maybeInit()?.setTags(tags); } catch { /* fail-open */ } },
   setExtra(key: string, value: unknown): void { try { maybeInit()?.setExtra(key, value); } catch { /* fail-open */ } },
   setExtras(extras: Record<string, unknown>): void { try { maybeInit()?.setExtras(extras); } catch { /* fail-open */ } },
+  addEventProcessor(processor: ErrorEventProcessor): void { try { maybeInit()?.addEventProcessor(processor); } catch { /* fail-open */ } },
   setContext(name: string, ctx: Record<string, unknown> | null): void { try { maybeInit()?.setContext(name, ctx); } catch { /* fail-open */ } },
   setLevel(level: SeverityLevel): void { try { maybeInit()?.setLevel(level); } catch { /* fail-open */ } },
   setFingerprint(fingerprint: string[] | null): void { try { maybeInit()?.setFingerprint(fingerprint); } catch { /* fail-open */ } },
@@ -1482,6 +1624,16 @@ export const AllStak: any = {
       return client ? client.withScope(callback) : callback(new Scope());
     }
     catch { return callback(new Scope()); }
+  },
+  getCurrentScope(): Scope | null {
+    try { return maybeInit()?.getCurrentScope() ?? null; } catch { return null; }
+  },
+  configureScope(callback: (scope: Scope) => void): void {
+    try {
+      const client = maybeInit();
+      if (client) client.configureScope(callback);
+      else callback(new Scope());
+    } catch { /* fail-open */ }
   },
   startSpan(operation: string, options?: SpanOptions): Span {
     try { return maybeInit()?.startSpan(operation, options) ?? noopSpan(operation); }

@@ -1,24 +1,8 @@
 # @allstak/react-native
 
-React Native SDK for AllStak error monitoring.
-
-[![npm version](https://img.shields.io/npm/v/@allstak/react-native.svg)](https://www.npmjs.com/package/@allstak/react-native)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## Agent-Assisted Setup
-
-Run the wizard:
-
-```bash
-npx @allstak/wizard@latest -i reactNative
-```
-
-The wizard patches your React Native project automatically. You only need to run
-it once, then commit the patched project files.
+AllStak React Native SDK for JavaScript errors, native crashes, logs, breadcrumbs, HTTP telemetry, navigation breadcrumbs, and source maps.
 
 ## Install
-
-If you prefer manual setup:
 
 ```bash
 npm install @allstak/react-native
@@ -28,61 +12,95 @@ Peer requirements:
 
 | Peer | Version |
 | --- | --- |
-| React | `>=16.8.0` |
-| React Native | `>=0.70` |
+| `react` | `>=16.8.0` |
+| `react-native` | `>=0.70` |
 
-## Configure
+## Setup
 
-Initialize the SDK as early as possible in your app entry file.
+Initialize the SDK as early as possible in your app entry file:
 
 ```tsx
-import * as AllStak from "@allstak/react-native";
+import * as AllStak from '@allstak/react-native';
+import App from './App';
 
 AllStak.init({
-  apiKey: "ask_live_...",
-  sendDefaultPii: true,
+  apiKey: process.env.EXPO_PUBLIC_ALLSTAK_API_KEY,
+  environment: process.env.NODE_ENV ?? 'production',
+  release: process.env.EXPO_PUBLIC_RELEASE,
+  tracesSampleRate: 1.0,
+  enableLogs: true,
 });
 
 export default AllStak.wrap(App);
 ```
 
-## Features
-
-Error monitoring is enabled by default after initialization. You can also turn
-on additional features when your project needs them:
+## Provider setup
 
 ```tsx
-AllStak.init({
-  apiKey: "ask_live_...",
-  sendDefaultPii: true,
-  // Capture 100% of tracing spans. Adjust this value in production.
-  tracesSampleRate: 1.0,
-  // Send logs created with AllStak.log(...) or AllStak.logger.*(...).
-  enableLogs: true,
+import { AllStakProvider } from '@allstak/react-native';
+
+export default function Root() {
+  return (
+    <AllStakProvider
+      apiKey={process.env.EXPO_PUBLIC_ALLSTAK_API_KEY}
+      environment="production"
+      release={process.env.EXPO_PUBLIC_RELEASE}
+    >
+      <App />
+    </AllStakProvider>
+  );
+}
+```
+
+## Metro source maps
+
+```js
+const { withAllStakConfig } = require('@allstak/react-native/metro');
+
+module.exports = withAllStakConfig({
+  resolver: {},
+  transformer: {},
 });
 ```
 
-## Verify
+## Expo plugin
 
-Add an intentional error while testing your setup. You should see it in AllStak
-within a few minutes.
-
-```tsx
-throw new Error("My first AllStak error!");
+```json
+{
+  "expo": {
+    "plugins": ["@allstak/react-native"]
+  }
+}
 ```
 
-## Next Steps
+## Useful API
 
-- Add readable stack traces with source maps.
-- Review data collection and privacy settings.
-- Capture custom errors and messages where needed.
+```tsx
+AllStak.captureException(new Error('checkout failed'));
+AllStak.captureMessage('cart opened', 'info');
+AllStak.logger.warn('payment retry');
+AllStak.setUser({ id: 'user_123', email: 'user@example.com' });
+await AllStak.flush();
+```
 
-## Links
+## Privacy
 
-- Dashboard: https://app.allstak.sa
-- Documentation: https://docs.allstak.sa
-- Package: https://www.npmjs.com/package/@allstak/react-native
+Use privacy components around sensitive UI so screenshots and replay metadata stay safe:
+
+```tsx
+import { AllStakPrivacyView } from '@allstak/react-native';
+
+<AllStakPrivacyView>
+  <CreditCardForm />
+</AllStakPrivacyView>
+```
+
+## Troubleshooting
+
+- No events: confirm the API key is available in the mobile runtime.
+- Native crashes missing: rebuild the native app after adding the package or Expo plugin.
+- Source maps missing: keep runtime `release` aligned with the uploaded build release.
 
 ## License
 
-MIT (c) AllStak
+MIT

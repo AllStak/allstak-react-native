@@ -48,6 +48,7 @@ export type {
   AllStakConfig,
   Breadcrumb,
   EventId,
+  ErrorEventProcessor,
   LogLevel,
   LogEnvelope,
   ScreenshotArtifact,
@@ -66,8 +67,11 @@ export const addBreadcrumb = AllStak.addBreadcrumb;
 export const setUser = AllStak.setUser;
 export const setTag = AllStak.setTag;
 export const setTags = AllStak.setTags;
+export const addEventProcessor = AllStak.addEventProcessor;
 export const setContext = AllStak.setContext;
 export const withScope = AllStak.withScope;
+export const getCurrentScope = AllStak.getCurrentScope;
+export const configureScope = AllStak.configureScope;
 export const startSpan = AllStak.startSpan;
 export const flush = AllStak.flush;
 

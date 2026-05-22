@@ -121,19 +121,43 @@ test('concurrent async withScope calls do not leak context across requests', asy
   await Promise.all([handle('A'), handle('B'), handle('C'), handle('D')]);
   await new Promise((r) => setTimeout(r, 80));
 
-  // Note: in this single-event-loop runtime the scope stack is shared, so
-  // concurrent overlapping withScope CAN see each other's tags. The test
-  // here proves the basic wrap-and-pop discipline (every err-X is captured
-  // and contains a `req` tag). For true per-request isolation across
-  // overlapping awaits, server frameworks should pair this with
-  // AsyncLocalStorage in their request handler.
   assert.equal(sent.length, 4);
-  const messages = sent.map((s) => JSON.parse(s.init.body).message).sort();
+  const bodies = sent.map((s) => JSON.parse(s.init.body));
+  const messages = bodies.map((body) => body.message).sort();
   assert.deepEqual(messages, ['err-A', 'err-B', 'err-C', 'err-D']);
-  for (const s of sent) {
-    const body = JSON.parse(s.init.body);
-    assert.ok(body.metadata.req, 'every request capture must carry a req tag');
+  const byMessage = Object.fromEntries(bodies.map((body) => [body.message, body]));
+  for (const reqId of ['A', 'B', 'C', 'D']) {
+    assert.equal(byMessage[`err-${reqId}`].metadata.req, reqId);
+    assert.deepEqual(byMessage[`err-${reqId}`].user, { id: `u-${reqId}` });
   }
+});
+
+test('configureScope mutates active scope or global defaults', async () => {
+  sent.length = 0;
+  AllStak.init({ apiKey: 'k' });
+
+  AllStak.configureScope((scope) => {
+    scope.setTag('global', 'yes');
+  });
+  AllStak.withScope((scope) => {
+    scope.setTag('local', 'yes');
+    AllStak.configureScope((current) => {
+      assert.equal(current, scope);
+      current.setTag('configured', 'active');
+    });
+    AllStak.captureException(new Error('inside-configure'));
+  });
+  AllStak.captureException(new Error('outside-configure'));
+  await new Promise((r) => setTimeout(r, 80));
+
+  const inside = JSON.parse(sent[0].init.body).metadata;
+  const outside = JSON.parse(sent[1].init.body).metadata;
+  assert.equal(inside.global, 'yes');
+  assert.equal(inside.local, 'yes');
+  assert.equal(inside.configured, 'active');
+  assert.equal(outside.global, 'yes');
+  assert.equal(outside.local, undefined);
+  assert.equal(outside.configured, undefined);
 });
 
 test('scope is popped after a synchronous throw inside the callback', async () => {

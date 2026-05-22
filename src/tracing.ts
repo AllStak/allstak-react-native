@@ -6,8 +6,8 @@
  * batch into the transport's `/ingest/v1/spans` channel and ship every 5s
  * (or when 20 spans accumulate).
  *
- * Trace propagation: each span carries a `traceId` (UUID, generated lazily
- * on first call to `getTraceId()`) and a `spanId`. Nested calls to
+ * Trace propagation: each span carries a W3C-compatible 32-hex `traceId`
+ * (generated lazily on first call to `getTraceId()`) and a 16-hex `spanId`. Nested calls to
  * `startSpan()` automatically inherit the active span as their parent.
  *
  * Sampling: `tracesSampleRate` (config) gates whether `startSpan` actually
@@ -55,12 +55,17 @@ export interface SpanOptions {
   startTimeMillis?: number;
 }
 
-function id(): string {
-  // Same v4 shape used elsewhere in the SDK — RN doesn't ship
-  // crypto.randomUUID reliably across versions.
+function randomHex(len: number): string {
   const hex = (n: number) => Math.floor(Math.random() * n).toString(16).padStart(1, '0');
-  const seg = (len: number) => Array.from({ length: len }, () => hex(16)).join('');
-  return `${seg(8)}-${seg(4)}-4${seg(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${seg(3)}-${seg(12)}`;
+  return Array.from({ length: len }, () => hex(16)).join('');
+}
+
+function traceId(): string {
+  return randomHex(32);
+}
+
+function spanId(): string {
+  return randomHex(16);
 }
 
 export class Span {
@@ -173,7 +178,7 @@ export class TracingModule {
   /** Get (and lazily create) the active trace ID. */
   getTraceId(): string {
     if (!this.currentTraceId) {
-      this.currentTraceId = id();
+      this.currentTraceId = traceId();
       this.ensureSamplingDecision();
     }
     return this.currentTraceId;
@@ -205,12 +210,12 @@ export class TracingModule {
    */
   startSpan(operation: string, options: SpanOptions = {}): Span {
     const traceId = this.getTraceId();
-    const spanId = id();
+    const spanIdValue = spanId();
     const parentSpanId = this.getCurrentSpanId() ?? '';
 
     if (!this.ensureSamplingDecision()) {
       // Sampled out — return a no-op so the public API shape is stable.
-      return new NoopSpan(traceId, spanId);
+      return new NoopSpan(traceId, spanIdValue);
     }
 
     const attributes: Record<string, string> = {};
@@ -218,7 +223,7 @@ export class TracingModule {
       if (value != null) attributes[key] = String(value);
     }
     const span = new Span(
-      traceId, spanId, parentSpanId,
+      traceId, spanIdValue, parentSpanId,
       operation, options.op ?? operation, options.platform ?? this.opts.platform ?? '',
       options.description ?? '',
       this.opts.service ?? '', this.opts.environment ?? '',

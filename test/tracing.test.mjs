@@ -47,8 +47,8 @@ test('startSpan creates a span; finish enqueues with correct shape', async () =>
   assert.equal(s.tags.route, '/api');
   assert.equal(s.tags.userId, 'u-1');
   assert.equal(s.service, 'svc-A');
-  assert.ok(typeof s.traceId === 'string' && s.traceId.length > 0);
-  assert.ok(typeof s.spanId === 'string' && s.spanId.length > 0);
+  assert.match(s.traceId, /^[a-f0-9]{32}$/);
+  assert.match(s.spanId, /^[a-f0-9]{16}$/);
   assert.equal(s.parentSpanId, '');
   assert.ok(s.durationMs >= 0);
 });
