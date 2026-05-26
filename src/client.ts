@@ -111,6 +111,8 @@ export interface AllStakConfig {
    * App-config and env detection are unaffected by this flag.
    */
   autoDetectRelease?: boolean;
+  /** Register the resolved release with AllStak at SDK init. Default true. */
+  autoRegisterRelease?: boolean;
   user?: { id?: string; email?: string };
   tags?: Record<string, string>;
   /** Per-event extra data attached to every capture (override per call via context arg). */
@@ -457,6 +459,26 @@ function eventDedupeKey(event: ErrorIngestPayload): string {
   return [event.exceptionClass, event.message, fingerprint, firstFrame].join('|');
 }
 
+function isLikelyTestRuntime(): boolean {
+  const proc = (globalThis as any).process;
+  const env = proc?.env ?? {};
+  const lifecycle = String(env.npm_lifecycle_event ?? '');
+  return env.NODE_ENV === 'test' || lifecycle.includes('test') || Boolean(env.VITEST);
+}
+
+function registerRuntimeRelease(config: AllStakConfig, transport: HttpTransport): void {
+  if (config.autoRegisterRelease === false || !config.apiKey || !config.release) return;
+  if (isLikelyTestRuntime()) return;
+  void transport.send('/ingest/v1/releases', {
+    version: config.release,
+    environment: config.environment,
+    commitSha: config.commitSha,
+    branch: config.branch,
+    author: null,
+    message: null,
+  });
+}
+
 function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -527,6 +549,7 @@ export class AllStakClient {
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;
     const baseUrl = (config.host ?? INGEST_HOST).replace(/\/$/, '');
     this.transport = new HttpTransport(baseUrl, config.apiKey ?? '', Boolean(config.apiKey));
+    registerRuntimeRelease(this.config, this.transport);
     this.tracing = new TracingModule(this.transport, {
       service: this.config.service ?? this.config.release ?? '',
       environment: this.config.environment ?? 'production',
