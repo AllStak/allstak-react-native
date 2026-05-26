@@ -9,11 +9,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface AllStakCrashHandler : NSObject
 
-/// Install the NSUncaughtExceptionHandler. Idempotent.
+/// Install the crash handlers. Idempotent. Arms BOTH:
+///   1. the NSUncaughtExceptionHandler (Obj-C NSExceptions), and
+///   2. async-signal-safe sigaction handlers for SIGSEGV/SIGABRT/SIGBUS/
+///      SIGILL/SIGFPE/SIGTRAP (see AllStakSignalCrashHandler) — the dominant
+///      class of real native crashes, which never raise an NSException.
 + (void)installWithRelease:(nullable NSString *)release;
 
-/// Returns the JSON payload stashed by the previous crash (or nil), and
-/// clears it from NSUserDefaults.
+/// Returns the JSON payload stashed by the previous crash (or nil) and clears
+/// it. Drains BOTH the NSException store (NSUserDefaults) and the POSIX signal
+/// record (converted to the same JSON shape); returns whichever is pending.
 + (nullable NSString *)drainPendingCrash;
 
 @end

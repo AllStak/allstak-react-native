@@ -5,6 +5,7 @@
 // third-party dependencies.
 
 #import "AllStakCrashHandler.h"
+#import "AllStakSignalCrashHandler.h"
 #import <UIKit/UIKit.h>
 
 static NSString * const kAllStakPendingCrashKey = @"io.allstak.rn.pending_crash";
@@ -63,14 +64,35 @@ static void AllStakHandleUncaughtException(NSException *exception) {
         gAllStakPreviousHandler = NSGetUncaughtExceptionHandler();
         NSSetUncaughtExceptionHandler(&AllStakHandleUncaughtException);
     }
+    // Also arm the async-signal-safe POSIX signal handlers (SIGSEGV/SIGABRT/
+    // ...). NSUncaughtExceptionHandler only catches Obj-C NSExceptions; the
+    // dominant class of native crashes deliver a signal instead. Gated by the
+    // same enable flag — this method is only called when JS opts into native
+    // crash handling (autoNativeCrashHandling).
+    [AllStakSignalCrashHandler installWithRelease:release];
 }
 
 + (NSString *)drainPendingCrash {
+    // 1. NSException JSON stashed in NSUserDefaults (the managed-runtime path).
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *json = [defaults stringForKey:kAllStakPendingCrashKey];
+    NSString *exceptionJSON = [defaults stringForKey:kAllStakPendingCrashKey];
     [defaults removeObjectForKey:kAllStakPendingCrashKey];
     [defaults synchronize];
-    return json;
+
+    // 2. POSIX signal record persisted by the async-signal-safe handler,
+    //    converted on this (normal) launch to the SAME JSON payload shape.
+    //    Always drain it so a record never leaks, even if we return the
+    //    NSException one below.
+    NSString *signalJSON = [AllStakSignalCrashHandler drainPendingSignalCrashJSON];
+
+    // A process delivers at most one fatal crash before it dies, so in
+    // practice only one source is populated per launch. If both happen to be
+    // present, prefer the NSException JSON (richer Obj-C symbolated frames);
+    // the signal record was still drained above so it won't replay.
+    if (exceptionJSON != nil && exceptionJSON.length > 0) {
+        return exceptionJSON;
+    }
+    return signalJSON;
 }
 
 @end

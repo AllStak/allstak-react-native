@@ -26,6 +26,19 @@ import java.io.StringWriter;
  * handler continues to work even if the RN bridge is already torn down.
  *
  * SCAFFOLDED — requires real device/emulator run to fully verify.
+ *
+ * SCOPE NOTE — NATIVE (NDK) SIGNALS ARE NOT YET CAPTURED ON ANDROID.
+ * This handler only sees JVM {@link Throwable}s. The dominant class of native
+ * crashes on Android — SIGSEGV/SIGABRT from JNI, C/C++ libs, the NDK, or the
+ * JSI/Hermes engine — deliver a POSIX signal that the JVM
+ * UncaughtExceptionHandler never observes (the process is killed by the
+ * kernel; Android writes a /data/tombstones/ entry instead). Capturing those
+ * requires an async-signal-safe native (C/C++) sigaction handler compiled via
+ * the NDK + a tombstone/record parser, mirroring what the iOS side now does in
+ * AllStakSignalCrashHandler. That is a separate, larger task and is a
+ * deliberate FOLLOW-UP — it is intentionally NOT half-implemented here to
+ * avoid shipping a broken/partial NDK build. See the iOS implementation for
+ * the reference approach to port.
  */
 public final class AllStakCrashHandler {
     private static final String TAG = "AllStakCrashHandler";
