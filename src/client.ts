@@ -38,6 +38,7 @@ import {
   type AllStakContexts,
   type CollectContextOptions,
 } from './contexts';
+import { resolveRelease } from './release-detect';
 import {
   buildExceptionChain,
   maybeExtractHttpRequest,
@@ -98,6 +99,18 @@ export interface AllStakConfig {
   host?: string;
   environment?: string;
   release?: string;
+  /**
+   * Auto-detect `release` when it is not set explicitly. Default: `true`.
+   *
+   * NOTE: a React Native JS runtime has no `child_process`, so RUNTIME local-git
+   * detection is impossible — the git step is a documented no-op. The realistic
+   * RN release is a build-time value. The effective order on RN is:
+   * explicit → env vars (bundle-time) → native app-config (`buildAutoRelease`:
+   * `<bundleId>@<version>+<build>`) → SDK version. Set `false` to disable the
+   * git probe AND the SDK-version fallback (release may then be left empty).
+   * App-config and env detection are unaffected by this flag.
+   */
+  autoDetectRelease?: boolean;
   user?: { id?: string; email?: string };
   tags?: Record<string, string>;
   /** Per-event extra data attached to every capture (override per call via context arg). */
@@ -488,8 +501,27 @@ export class AllStakClient {
       const { contexts, tags } = collectAutoContexts(opts);
       this.autoContexts = contexts;
       this.autoTags = tags;
-      if (!this.config.release) this.config.release = buildAutoRelease(contexts.app);
+      // Resolve release: explicit → RN native app-config (buildAutoRelease) →
+      // env (bundle-time) → local git (RN no-op) → SDK-version fallback.
+      // App-config stays authoritative (pre-existing behavior); git + version
+      // fallback gated by autoDetectRelease (default true).
+      this.config.release = resolveRelease(
+        this.config.release,
+        buildAutoRelease(contexts.app),
+        this.config.sdkVersion ?? SDK_VERSION,
+        this.config.autoDetectRelease !== false,
+      );
     } catch { /* never break init */ }
+    // Safety net: if context collection threw before release was resolved,
+    // still apply env → SDK-version fallback (no app-config available here).
+    if (!this.config.release) {
+      this.config.release = resolveRelease(
+        undefined,
+        undefined,
+        this.config.sdkVersion ?? SDK_VERSION,
+        this.config.autoDetectRelease !== false,
+      );
+    }
 
     this.sessionId = generateId();
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;

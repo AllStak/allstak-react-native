@@ -57,6 +57,14 @@ export type {
 } from './client';
 export type { TransportStats } from './transport';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
+export {
+  parseGitRelease,
+  resolveRelease,
+  releaseFromEnv,
+  isNodeRuntime,
+  __resetGitReleaseCacheForTest,
+} from './release-detect';
+export type { GitRunner } from './release-detect';
 
 export const init = AllStak.init;
 export const captureException = AllStak.captureException;
