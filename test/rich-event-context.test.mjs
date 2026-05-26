@@ -29,6 +29,7 @@ const {
   collectAutoContexts,
   buildAutoRelease,
   buildUserContext,
+  SDK_VERSION,
 } = await import('../dist/index.mjs');
 
 function lastBody() { return sent[sent.length - 1]?.body; }
@@ -429,12 +430,12 @@ test('buildExceptionChain handles single error', () => {
 
 // ── SDK identity / version ─────────────────────────────────────
 
-test('SDK version reports 0.5.9', async () => {
+test('SDK version on the wire matches the package SDK_VERSION', async () => {
   init();
   sent.length = 0;
   AllStak.captureException(new Error('v'));
   await waitTransport();
-  assert.equal(lastBody().sdkVersion, '0.5.9');
+  assert.equal(lastBody().sdkVersion, SDK_VERSION);
 });
 
 // ── no leaks of sensitive headers ──────────────────────────────

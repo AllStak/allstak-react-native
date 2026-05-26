@@ -56,7 +56,7 @@ declare const require: undefined | ((id: string) => { AsyncLocalStorage?: new ()
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.5.9';
+export const SDK_VERSION = '0.5.11';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';
