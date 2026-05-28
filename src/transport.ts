@@ -5,7 +5,22 @@
  * unavailable.
  *
  * No window, no AbortController fallback shims — RN exposes both natively.
+ *
+ * Offline durability (0.5.12+): when an event still can't be delivered after
+ * the in-memory ring buffer (network outage, retries exhausted, app shutting
+ * down), the ALREADY-PII-SCRUBBED payload is written to a pluggable persistent
+ * store and replayed on the next init through this same transport (so retry /
+ * backoff / circuit-breaker behavior is inherited). Session lifecycle calls
+ * (/sessions/start, /sessions/end) are excluded — a replayed stale session
+ * would skew release-health durations. Fully fail-open: a broken/unwritable
+ * store degrades silently to the prior in-memory-only behavior.
  */
+
+import {
+  PersistentEventStore,
+  type PersistenceOptions,
+  type PersistedEntry,
+} from './persistence';
 
 declare const __DEV__: boolean | undefined;
 
@@ -15,9 +30,38 @@ const FAILURE_THRESHOLD = 3;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
 
+/**
+ * Paths that must NEVER be persisted across a restart. Session lifecycle is
+ * best-effort live-only: replaying a stale `/sessions/start` or `/sessions/end`
+ * after a relaunch would corrupt release-health durations / crash-free rates.
+ */
+const NON_PERSISTABLE_PATH_PREFIXES = ['/ingest/v1/sessions/'];
+
+function isPersistablePath(path: string): boolean {
+  return !NON_PERSISTABLE_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * A 4xx (other than 429) is a permanent rejection — the server will never
+ * accept this payload, so it must be removed from the persistent store rather
+ * than retried forever. Everything else (network error, timeout, 429, 5xx) is
+ * transient and stays queued. Status is parsed from the `HTTP <code>` error
+ * thrown by {@link HttpTransport.doFetch}; a network error has no status and is
+ * therefore treated as transient (keep).
+ */
+function isPermanentFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const match = /HTTP\s+(\d{3})/.exec(message);
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status >= 400 && status < 500 && status !== 429;
+}
+
 interface Pending {
   path: string;
   payload: unknown;
+  /** Set when this item originated from the persistent store (drained on init). */
+  persistedId?: string;
 }
 
 export interface TransportStats {
@@ -29,6 +73,12 @@ export interface TransportStats {
   circuitOpenUntil: number;
   lastTransportLatencyMs?: number;
   lastFlushDurationMs?: number;
+  /** Whether the durable offline queue is active. */
+  persistenceEnabled?: boolean;
+  /** Entries replayed from the durable store this session and accepted. */
+  persistedReplayed?: number;
+  /** Persisted entries dropped due to a permanent (4xx non-429) rejection. */
+  persistedDropped?: number;
 }
 
 export class HttpTransport {
@@ -42,12 +92,27 @@ export class HttpTransport {
   private dropped = 0;
   private lastTransportLatencyMs: number | undefined;
   private lastFlushDurationMs: number | undefined;
+  /** Persistent offline store (null when offline-queue is disabled). */
+  private store: PersistentEventStore | null = null;
+  private persistedReplayed = 0;
+  private persistedDropped = 0;
 
   constructor(
     private baseUrl: string,
     private apiKey: string,
     private enabled = true,
-  ) {}
+    persistence?: PersistenceOptions,
+  ) {
+    if (persistence && persistence.enabled !== false) {
+      try {
+        this.store = new PersistentEventStore(persistence);
+        if (!this.store.isEnabled()) this.store = null;
+      } catch {
+        // Store construction must never break SDK init.
+        this.store = null;
+      }
+    }
+  }
 
   send(path: string, payload: unknown): Promise<void> {
     if (!this.enabled) {
@@ -136,12 +201,60 @@ export class HttpTransport {
       this.sent++;
       this.consecutiveFailures = 0;
       this.circuitOpenUntil = 0;
+      this.onDelivered(item);
       this.scheduleFlush();
     } catch (err) {
       this.failed++;
       this.recordFailure(err);
-      this.push(item);
+      this.onFailed(item, err);
     }
+  }
+
+  /**
+   * Called when an item is accepted (2xx). If it came from (or was written to)
+   * the persistent store, remove it now that it's safely delivered.
+   */
+  private onDelivered(item: Pending): void {
+    if (item.persistedId && this.store) {
+      this.persistedReplayed++;
+      void this.store.remove(item.persistedId).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Called when an item failed delivery. Re-queue it in the in-memory buffer
+   * (existing behavior) AND, for persistable telemetry, write the
+   * already-scrubbed payload to the durable store so it survives a restart.
+   * A permanent 4xx (non-429) is dropped from the store instead of retried.
+   */
+  private onFailed(item: Pending, err: unknown): void {
+    if (this.store && isPersistablePath(item.path)) {
+      if (isPermanentFailure(err)) {
+        // Server will never accept this — drop it, don't keep retrying.
+        this.dropped++;
+        if (item.persistedId) {
+          this.persistedDropped++;
+          void this.store.remove(item.persistedId).catch(() => undefined);
+        }
+        return;
+      }
+      if (item.persistedId) {
+        // Already in the store from a previous launch — keep it for the next
+        // drain; just retry in-memory this session.
+        this.push(item);
+        return;
+      }
+      // First failure for a live event: persist the scrubbed payload and tag
+      // the in-memory copy with its id so a later in-memory 2xx removes the
+      // durable entry (no duplicate replay on the next init).
+      void this.store
+        .persist(item.path, item.payload)
+        .then((id) => {
+          if (id) item.persistedId = id;
+        })
+        .catch(() => undefined);
+    }
+    this.push(item);
   }
 
   private async doFetch(path: string, payload: unknown): Promise<void> {
@@ -199,10 +312,11 @@ export class HttpTransport {
           this.sent++;
           this.consecutiveFailures = 0;
           this.circuitOpenUntil = 0;
+          this.onDelivered(item);
         } catch (err) {
           this.failed++;
           this.recordFailure(err);
-          this.push(item);
+          this.onFailed(item, err);
         }
       }
     } finally {
@@ -218,6 +332,38 @@ export class HttpTransport {
     const retryAfterMs = retryAfterFromError(error);
     const backoff = retryAfterMs ?? jitteredBackoff(this.consecutiveFailures);
     this.circuitOpenUntil = Date.now() + backoff;
+  }
+
+  /**
+   * Replay events persisted on a previous launch/outage. Loads the durable
+   * store and re-enqueues each entry through the normal transport path so the
+   * existing retry / backoff / circuit-breaker applies. Entries are removed
+   * from the store only after a 2xx accept (in {@link onDelivered}) or a
+   * permanent 4xx (in {@link onFailed}). Fully fail-open and asynchronous — it
+   * never blocks init or capture. No-op when the offline queue is disabled.
+   *
+   * Returns the number of entries scheduled for replay (0 on any failure).
+   */
+  async drainPersisted(): Promise<number> {
+    if (!this.enabled || !this.store) return 0;
+    let entries: PersistedEntry[] = [];
+    try {
+      entries = await this.store.load();
+    } catch {
+      return 0;
+    }
+    let scheduled = 0;
+    for (const entry of entries) {
+      // Defence in depth: never replay a session-lifecycle call even if one
+      // somehow landed in the store.
+      if (!isPersistablePath(entry.path)) {
+        void this.store.remove(entry.id).catch(() => undefined);
+        continue;
+      }
+      this.enqueueOrDispatch({ path: entry.path, payload: entry.payload, persistedId: entry.id });
+      scheduled++;
+    }
+    return scheduled;
   }
 
   getBufferSize(): number {
@@ -238,7 +384,15 @@ export class HttpTransport {
       circuitOpenUntil: this.circuitOpenUntil,
       lastTransportLatencyMs: this.lastTransportLatencyMs,
       lastFlushDurationMs: this.lastFlushDurationMs,
+      persistenceEnabled: this.store !== null,
+      persistedReplayed: this.persistedReplayed,
+      persistedDropped: this.persistedDropped,
     };
+  }
+
+  /** @internal — test seam: the durable store, or null when disabled. */
+  __getStoreForTest(): PersistentEventStore | null {
+    return this.store;
   }
 
   /**

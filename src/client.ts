@@ -40,6 +40,7 @@ import {
 } from './contexts';
 import { resolveRelease } from './release-detect';
 import { SessionTracker } from './session';
+import type { PersistenceOptions, PersistenceStorage } from './persistence';
 import {
   buildExceptionChain,
   maybeExtractHttpRequest,
@@ -123,6 +124,27 @@ export interface AllStakConfig {
    * opt out. Automatically skipped under a unit-test runtime.
    */
   enableAutoSessionTracking?: boolean;
+  /**
+   * Offline / persistent event queue (0.5.12+). When an event can't be
+   * delivered (network outage, retries exhausted, app shutting down) its
+   * already-PII-scrubbed payload is written to a durable store and replayed on
+   * the next init through the same transport (so retry / backoff /
+   * circuit-breaker apply). Bounded by count, bytes and age; oldest dropped
+   * when full. Session lifecycle calls are never persisted. Fully fail-open: a
+   * read-only / sandboxed / missing store degrades silently to in-memory.
+   *
+   * RN bundles no native filesystem, so persistence is a pluggable adapter.
+   * Provide one via `offlineQueue.storage` or the global `setPersistence(...)`
+   * (e.g. `@react-native-async-storage/async-storage`). Without an adapter the
+   * SDK auto-detects a global AsyncStorage/localStorage and otherwise keeps the
+   * prior in-memory-only behavior.
+   *
+   * Default: `true`. Set `false` to opt out entirely. Automatically skipped
+   * under a unit-test runtime unless `offlineQueue` is configured explicitly.
+   */
+  enableOfflineQueue?: boolean;
+  /** Fine-grained persistence options for the offline event queue. */
+  offlineQueue?: PersistenceOptions;
   user?: { id?: string; email?: string };
   tags?: Record<string, string>;
   /** Per-event extra data attached to every capture (override per call via context arg). */
@@ -560,7 +582,12 @@ export class AllStakClient {
     this.sessionId = generateId();
     this.maxBreadcrumbs = config.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS;
     const baseUrl = (config.host ?? INGEST_HOST).replace(/\/$/, '');
-    this.transport = new HttpTransport(baseUrl, config.apiKey ?? '', Boolean(config.apiKey));
+    this.transport = new HttpTransport(
+      baseUrl,
+      config.apiKey ?? '',
+      Boolean(config.apiKey),
+      this.resolvePersistenceOptions(),
+    );
     registerRuntimeRelease(this.config, this.transport);
     this.tracing = new TracingModule(this.transport, {
       service: this.config.service ?? this.config.release ?? '',
@@ -617,6 +644,28 @@ export class AllStakClient {
     try {
       this.startSessionTracking();
     } catch { /* never break init */ }
+
+    // ── Offline queue: replay events persisted on a previous launch/outage ──
+    // Asynchronous + fail-open: never blocks init or capture. Re-sends through
+    // the existing transport so retry/backoff/circuit-breaker apply.
+    try {
+      void this.transport.drainPersisted().catch(() => undefined);
+    } catch { /* never break init */ }
+  }
+
+  /**
+   * Resolve the persistence options passed to the transport. The offline queue
+   * is ON by default, OFF when `enableOfflineQueue === false`, and skipped under
+   * a unit-test runtime UNLESS the host explicitly configured `offlineQueue`
+   * (so tests can opt in with a fake adapter). Returns `undefined` to disable.
+   */
+  private resolvePersistenceOptions(): PersistenceOptions | undefined {
+    if (this.config.enableOfflineQueue === false) return undefined;
+    const explicit = this.config.offlineQueue;
+    if (explicit?.enabled === false) return undefined;
+    // Under a unit-test runtime, only enable when the host opted in explicitly.
+    if (isLikelyTestRuntime() && !explicit) return undefined;
+    return { enabled: true, ...(explicit ?? {}) };
   }
 
   /**

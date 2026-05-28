@@ -56,6 +56,7 @@ export type {
   SeverityLevel,
 } from './client';
 export type { TransportStats } from './transport';
+export { HttpTransport } from './transport';
 export { AllStakClient, INGEST_HOST, SDK_NAME, SDK_VERSION, Scope } from './client';
 export {
   parseGitRelease,
@@ -175,6 +176,19 @@ export type {
   SessionStartFields,
   SessionTrackerOptions,
 } from './session';
+
+// ── Offline / persistent event queue (0.5.12+) ──────────────────
+export {
+  setPersistence,
+  detectDefaultStorage,
+  PersistentEventStore,
+  __getPersistenceOverrideForTest,
+} from './persistence';
+export type {
+  PersistenceStorage,
+  PersistenceOptions,
+  PersistedEntry,
+} from './persistence';
 
 // ── Native crash drain ──────────────────────────────────────────
 
