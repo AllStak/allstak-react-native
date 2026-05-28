@@ -39,6 +39,7 @@ import {
   type CollectContextOptions,
 } from './contexts';
 import { resolveRelease } from './release-detect';
+import { SessionTracker } from './session';
 import {
   buildExceptionChain,
   maybeExtractHttpRequest,
@@ -113,6 +114,15 @@ export interface AllStakConfig {
   autoDetectRelease?: boolean;
   /** Register the resolved release with AllStak at SDK init. Default true. */
   autoRegisterRelease?: boolean;
+  /**
+   * Release-health session tracking: one session per app-launch. On init the
+   * SDK POSTs `/ingest/v1/sessions/start`; on graceful shutdown (app
+   * background→terminate / `close()`) it POSTs `/ingest/v1/sessions/end` with
+   * the final status (`ok` / `errored` / `crashed`). Sessions are never sampled
+   * and the lifecycle is fully fail-open. Default: `true`. Set `false` to
+   * opt out. Automatically skipped under a unit-test runtime.
+   */
+  enableAutoSessionTracking?: boolean;
   user?: { id?: string; email?: string };
   tags?: Record<string, string>;
   /** Per-event extra data attached to every capture (override per call via context arg). */
@@ -505,6 +515,8 @@ export class AllStakClient {
   private currentTransaction: string | null = null;
   private eventProcessors: ErrorEventProcessor[] = [];
   private lastEventKey: string | null = null;
+  /** Release-health session tracker (one session per launch). Null when off. */
+  private sessionTracker: SessionTracker | null = null;
 
   constructor(config: AllStakConfig) {
     this.config = { ...config };
@@ -600,6 +612,47 @@ export class AllStakClient {
         this._instrumentAxios = instrumentAxios;
       } catch { /* never break init */ }
     }
+
+    // ── Release-health session: one session per launch (fail-open) ─────────
+    try {
+      this.startSessionTracking();
+    } catch { /* never break init */ }
+  }
+
+  /**
+   * Start the release-health session for this launch. Reuses the SDK's
+   * correlation `sessionId`, records the start timestamp, and POSTs
+   * `/ingest/v1/sessions/start` through the existing transport. Registers an
+   * AppState listener that ends the session when the app is backgrounded /
+   * terminated. Skipped when `enableAutoSessionTracking` is false or under a
+   * unit-test runtime. Fully fail-open.
+   */
+  private startSessionTracking(): void {
+    if (this.config.enableAutoSessionTracking === false) return;
+    const release = this.config.release ?? this.config.sdkVersion ?? SDK_VERSION;
+    this.sessionTracker = new SessionTracker(
+      this.transport,
+      {
+        // Fall back to sdkVersion when no release is resolved (per contract).
+        release,
+        environment: this.config.environment,
+        userId: this.config.user?.id,
+        sdkName: this.config.sdkName,
+        sdkVersion: this.config.sdkVersion,
+        platform: this.config.platform,
+      },
+      { sessionId: this.sessionId, skipNetwork: isLikelyTestRuntime() },
+    );
+    this.sessionTracker.start();
+  }
+
+  /**
+   * Gracefully end the release-health session: computes durationMs and POSTs
+   * `/ingest/v1/sessions/end` with the accumulated status. Idempotent,
+   * best-effort, never throws.
+   */
+  endSession(status?: 'ok' | 'errored' | 'crashed' | 'abnormal'): void {
+    try { this.sessionTracker?.end(status); } catch { /* fail-open */ }
   }
 
   /** Access the replay surrogate (or null if not initialized / sampled out). */
@@ -716,6 +769,12 @@ export class AllStakClient {
     // ── Rich event enrichments ─────────────────────────────────
     const mechanism: MechanismType = opts?.mechanism ?? 'captureException';
     const handled = opts?.handled ?? (mechanism === 'captureException' || mechanism === 'errorboundary');
+    // Release-health: a HANDLED error → errored; an UNHANDLED/fatal/crash →
+    // crashed. In-memory only; the /sessions/end POST carries the final status.
+    try {
+      if (handled) this.sessionTracker?.recordError();
+      else this.sessionTracker?.recordCrash();
+    } catch { /* fail-open */ }
     payload.eventId = eventId;
     payload.timestamp = new Date().toISOString();
     payload.handled = handled;
@@ -1119,11 +1178,26 @@ export class AllStakClient {
 
   getSessionId(): string { return this.sessionId; }
 
+  /** @internal — release-health session tracker (exposed for testing). */
+  __getSessionTracker(): SessionTracker | null { return this.sessionTracker; }
+
   getConfig(): AllStakConfig { return this.config; }
 
   getTransportStats(): TransportStats { return this.transport.getStats(); }
 
+  /**
+   * Gracefully close the SDK: end the release-health session, then tear down.
+   * Mirrors the Java SDK `close()`. Best-effort and fail-open.
+   */
+  close(): void {
+    this.endSession();
+    this.destroy();
+  }
+
   destroy(): void {
+    // End the session before teardown so /sessions/end still fires (idempotent
+    // if it already ended on AppState background).
+    this.endSession();
     if (this.mobileFrameTimer) { clearInterval(this.mobileFrameTimer); this.mobileFrameTimer = null; }
     if (this.profileTimer) { clearInterval(this.profileTimer); this.profileTimer = null; }
     this.tracing.destroy();
@@ -1718,6 +1792,15 @@ export const AllStak: any = {
     try { return maybeInit()?.getTransportStats() ?? emptyStats(); } catch { return emptyStats(); }
   },
   destroy(): void { instance?.destroy(); instance = null; },
+  /**
+   * Gracefully close the SDK: ends the release-health session (POSTs
+   * `/sessions/end`) and tears down instrumentation. Call on app shutdown.
+   */
+  close(): void { try { instance?.close(); } catch { /* fail-open */ } instance = null; },
+  /** Manually end the release-health session early (best-effort, fail-open). */
+  endSession(status?: 'ok' | 'errored' | 'crashed' | 'abnormal'): void {
+    try { maybeInit()?.endSession(status); } catch { /* fail-open */ }
+  },
   /** @internal — exposed for testing */
   _getInstance(): AllStakClient | null { return instance; },
 };

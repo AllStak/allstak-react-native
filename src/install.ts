@@ -236,6 +236,13 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
           try {
             AllStak.addBreadcrumb('navigation', `AppState → ${next}`, 'info', { appState: next });
           } catch { /* ignore */ }
+          // Release-health: end the session when the app is backgrounded /
+          // becomes inactive (a single session per launch is acceptable for v1).
+          // Idempotent + fail-open on the client side.
+          if (next === 'background' || next === 'inactive') {
+            try { (AllStak as { endSession?: (s?: string) => void }).endSession?.(); }
+            catch { /* fail-open */ }
+          }
         });
       }
     } catch { /* no RN available */ }

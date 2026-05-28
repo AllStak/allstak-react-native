@@ -168,6 +168,14 @@ export {
 export { HttpRequestModule } from './http-requests';
 export type { HttpRequestEvent } from './http-requests';
 
+// ── Release-health session tracking (0.5.12+) ───────────────────
+export { Session, SessionTracker } from './session';
+export type {
+  SessionStatus,
+  SessionStartFields,
+  SessionTrackerOptions,
+} from './session';
+
 // ── Native crash drain ──────────────────────────────────────────
 
 declare const require: (id: string) => any;
