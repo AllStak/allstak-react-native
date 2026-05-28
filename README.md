@@ -101,6 +101,12 @@ import { AllStakPrivacyView } from '@allstak/react-native';
 - Native crashes missing: rebuild the native app after adding the package or Expo plugin.
 - Source maps missing: keep runtime `release` aligned with the uploaded build release.
 
+## Contributing and Support
+
+- Report bugs with the GitHub bug report template: https://github.com/AllStak/allstak-react-native/issues/new/choose
+- Open pull requests using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report security vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT
