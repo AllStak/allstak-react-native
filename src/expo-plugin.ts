@@ -67,7 +67,7 @@ function withAllStak(config: ExpoConfig & ExpoConfigContext, options: AllStakExp
     release: options.release ?? existing.release,
     environment: options.environment ?? existing.environment,
     dist: options.dist ?? existing.dist,
-    pluginVersion: '0.5.11',
+    pluginVersion: '0.6.0',
   };
 
   return next;
