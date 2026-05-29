@@ -5,3 +5,10 @@ dist/
 .venv/
 vendor/
 .DS_Store
+
+# npm pack output (built tarballs must never be committed)
+*.tgz
+
+# local scratch / demo apps (not part of the published package)
+examples/
+samples/
