@@ -169,6 +169,10 @@ export {
 export { HttpRequestModule } from './http-requests';
 export type { HttpRequestEvent } from './http-requests';
 
+// ── Value-pattern PII scrubbing (CC/SSN/email/IPv4) ─────────────
+export { scrubString, scrubValueTree, MAX_SCAN_LENGTH, MAX_DEPTH } from './value-scrub';
+export type { ValueScrubOptions } from './value-scrub';
+
 // ── Release-health session tracking (0.5.12+) ───────────────────
 export { Session, SessionTracker } from './session';
 export type {

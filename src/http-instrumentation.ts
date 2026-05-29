@@ -51,11 +51,12 @@ function safeCapture(ev: HttpRequestEvent): void {
   try { currentModule()?.capture(ev); } catch { /* never break host */ }
 }
 
-interface BoundOptions extends Required<Omit<HttpTrackingOptions, 'redactHeaders' | 'redactQueryParams' | 'ignoredUrls' | 'allowedUrls'>> {
+interface BoundOptions extends Required<Omit<HttpTrackingOptions, 'redactHeaders' | 'redactQueryParams' | 'ignoredUrls' | 'allowedUrls' | 'scrubPatterns'>> {
   redactHeaders: string[];
   redactQueryParams: string[];
   ignoredUrls: (string | RegExp)[];
   allowedUrls: (string | RegExp)[];
+  scrubPatterns: RegExp[] | undefined;
   ownIngestPrefix: string;
 }
 
@@ -91,6 +92,8 @@ function bind(opts: HttpTrackingOptions, ownIngestHost: string): BoundOptions {
     maxBodyBytes: opts.maxBodyBytes ?? 8192,
     allowedContentTypes: opts.allowedContentTypes ?? ['application/json', 'text/', 'application/problem+json'],
     redactBodyFields: opts.redactBodyFields ?? [],
+    sendDefaultPii: opts.sendDefaultPii ?? false,
+    scrubPatterns: opts.scrubPatterns,
     ownIngestPrefix: ownIngestHost.replace(/\/$/, ''),
   };
 }

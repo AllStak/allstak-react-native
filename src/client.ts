@@ -15,6 +15,7 @@ import { TracingModule, Span, type SpanData, type SpanOptions } from './tracing'
 import { ReplaySurrogate, ReplaySurrogateOptions } from './replay-surrogate';
 import { HttpRequestModule } from './http-requests';
 import type { HttpTrackingOptions } from './http-redact';
+import { scrubString, scrubValueTree, type ValueScrubOptions } from './value-scrub';
 import { installHttpInstrumentation, unbindHttpInstrumentation } from './http-instrumentation';
 import type { ConsoleCaptureOptions } from './auto-breadcrumbs';
 import {
@@ -281,7 +282,16 @@ export interface AllStakConfig {
   captureBattery?: boolean;
   /** Include screen dimensions + orientation. Default true. */
   captureScreenContext?: boolean;
-  /** Include user.email / user.ip_address on events. Default false. */
+  /**
+   * Opt into sending personally-identifiable information. Default FALSE
+   * (Sentry parity). Two effects:
+   *   - The explicit user object's `email` / `ip_address` are attached to
+   *     events (see {@link buildUserContext}).
+   *   - The value-pattern scrubbers for email + IPv4 in free-text values
+   *     (messages, metadata, breadcrumbs, logs) are DISABLED — the host has
+   *     opted in. Credit-card (Luhn) + US-SSN scrubbing is ALWAYS on
+   *     regardless of this flag, and `setUser` data is never value-scrubbed.
+   */
   sendDefaultPii?: boolean;
   /** Stamp client.ip on outgoing events. Default false. */
   collectIpAddress?: boolean;
@@ -623,8 +633,16 @@ export class AllStakClient {
           sdkName: this.config.sdkName,
           sdkVersion: this.config.sdkVersion,
         });
+        // Thread top-level PII settings into body capture so the value
+        // scrubbers (CC/SSN always; email/IPv4 gated) run on captured HTTP
+        // bodies. An explicit httpTracking value still wins.
+        const httpTrackingOpts: HttpTrackingOptions = {
+          sendDefaultPii: this.config.sendDefaultPii === true,
+          ...(this.config.scrubPatterns ? { scrubPatterns: this.config.scrubPatterns } : {}),
+          ...(config.httpTracking ?? {}),
+        };
         const { instrumentAxios } = installHttpInstrumentation(
-          this.httpRequests, config.httpTracking ?? {}, baseUrl,
+          this.httpRequests, httpTrackingOpts, baseUrl,
           {
             tracing: this.tracing,
             replay: this.replay,
@@ -1444,17 +1462,26 @@ export class AllStakClient {
 
     const send = (next: LogEnvelope | null | undefined) => {
       if (!next) return;
+      // Value-pattern PII scrubbing on the log free-text + attributes.
+      // Runs after beforeSendLog so a hook cannot reintroduce PII.
+      // Fail-open: scrubString / scrubValueTree never throw.
+      const opts = this.valueScrubOptions();
+      const message = typeof next.message === 'string' ? scrubString(next.message, opts) : next.message;
+      const metadata = scrubValueTree(
+        { ...this.buildMetadata(), ...(next.attributes ?? {}) },
+        opts,
+      );
       this.transport.send(LOGS_PATH, {
         timestamp: new Date(next.timestamp).toISOString(),
         level: next.level,
-        message: next.message,
+        message,
         sessionId: this.sessionId,
         environment: this.config.environment,
         release: this.config.release,
         platform: this.config.platform,
         sdkName: this.config.sdkName,
         sdkVersion: this.config.sdkVersion,
-        metadata: { ...this.buildMetadata(), ...(next.attributes ?? {}) },
+        metadata,
       });
     };
 
@@ -1642,7 +1669,80 @@ export class AllStakClient {
       catch { final = payload; /* never let a buggy hook drop telemetry */ }
     }
     if (!final || this.shouldDropDuplicate(final)) return;
-    return final;
+    // Value-pattern PII scrubbing runs LAST so a beforeSend hook cannot
+    // reintroduce unscrubbed PII. Fail-open: on any error keep `final`.
+    return this.scrubEventValues(final);
+  }
+
+  /** Options bag for the value-pattern scrubbers, read from config. */
+  private valueScrubOptions(): ValueScrubOptions {
+    return {
+      sendDefaultPii: this.config.sendDefaultPii === true,
+      scrubPatterns: this.config.scrubPatterns,
+    };
+  }
+
+  /**
+   * Apply value-pattern PII scrubbing (CC/SSN always; email/IPv4 unless
+   * `sendDefaultPii`) to the free-text fields of an outgoing error/message
+   * event. Returns a shallow-copied payload with scrubbed fields.
+   *
+   * Deliberately does NOT touch: the explicit `user` object (intentional
+   * identification, Sentry-parity), stack frames (filename/function/absPath),
+   * release / sdk / environment / platform / service fields, span/operation
+   * names, URLs/paths (own redactor), tags (filter/index keys), and the
+   * SDK's own `sessionId` / trace ids.
+   *
+   * Fail-open: any error returns the unscrubbed-but-key-redacted payload.
+   */
+  private scrubEventValues(event: ErrorIngestPayload): ErrorIngestPayload {
+    const opts = this.valueScrubOptions();
+    try {
+      const out: ErrorIngestPayload = { ...event };
+
+      if (typeof out.message === 'string') out.message = scrubString(out.message, opts);
+
+      // Exception chain: scrub the human-readable `value` (message) only;
+      // never the stacktrace frames.
+      if (out.exception?.values) {
+        out.exception = {
+          values: out.exception.values.map((ev) =>
+            typeof ev.value === 'string' ? { ...ev, value: scrubString(ev.value, opts) } : ev,
+          ),
+        };
+      }
+
+      // Free-text stack-trace strings array (filenames/functions live here,
+      // but it is presented as message-like text — leave as-is to avoid
+      // corrupting paths). Intentionally NOT scrubbed.
+
+      if (out.metadata) out.metadata = scrubValueTree(out.metadata, opts);
+
+      // Contexts: scrub every bag EXCEPT the explicit `user` bag and the
+      // `trace` ids (structured identifiers, not free text).
+      if (out.contexts) {
+        const ctx = out.contexts as Record<string, unknown>;
+        const scrubbed: Record<string, unknown> = {};
+        for (const [name, bag] of Object.entries(ctx)) {
+          scrubbed[name] = name === 'user' || name === 'trace' ? bag : scrubValueTree(bag, opts);
+        }
+        out.contexts = scrubbed as ErrorIngestPayload['contexts'];
+      }
+
+      // Breadcrumbs: scrub message + data, preserve timestamp/type/level.
+      if (out.breadcrumbs && out.breadcrumbs.length > 0) {
+        out.breadcrumbs = out.breadcrumbs.map((c) => {
+          const next: Breadcrumb = { ...c };
+          if (typeof next.message === 'string') next.message = scrubString(next.message, opts);
+          if (next.data) next.data = scrubValueTree(next.data, opts);
+          return next;
+        });
+      }
+
+      return out;
+    } catch {
+      return event; // fail-open
+    }
   }
 
   private shouldDropByFilters(event: ErrorIngestPayload): boolean {

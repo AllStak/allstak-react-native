@@ -17,6 +17,8 @@
  * case-insensitive on the URL.
  */
 
+import { scrubString } from './value-scrub';
+
 export const ALWAYS_REDACT_HEADERS = new Set([
   'authorization',
   'cookie',
@@ -105,6 +107,15 @@ export interface HttpTrackingOptions {
   allowedContentTypes?: string[];
   /** Additional JSON body fields to redact recursively. */
   redactBodyFields?: string[];
+  /**
+   * When true, the host opted into PII: email + IPv4 value-pattern
+   * scrubbing on captured body text is disabled. Credit-card (Luhn) +
+   * US-SSN scrubbing is ALWAYS applied. Default false. Threaded from the
+   * client's top-level `sendDefaultPii`.
+   */
+  sendDefaultPii?: boolean;
+  /** Caller-supplied value patterns; always applied to captured body text. */
+  scrubPatterns?: RegExp[];
 }
 
 export interface CapturedBody {
@@ -293,6 +304,10 @@ export function captureBodyResult(
       str = redactSensitiveText(str, opts);
     }
   }
+
+  // Value-pattern PII scrubbing over the key-redacted body text:
+  // CC (Luhn) + US-SSN always; email + IPv4 unless sendDefaultPii. Fail-open.
+  str = scrubString(str, { sendDefaultPii: opts.sendDefaultPii, scrubPatterns: opts.scrubPatterns });
 
   let truncated = false;
   if (str.length > maxBodyBytes) {
