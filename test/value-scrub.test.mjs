@@ -2,7 +2,7 @@
  * Value-pattern PII scrubbing tests for @allstak/react-native.
  *
  * Companion to sensitive-data-masking.test.mjs (key-name redaction).
- * Verifies the @sentry-parity value scrubbers:
+ * Verifies the value-pattern scrubbers:
  *
  *   A) ALWAYS (regardless of sendDefaultPii):
  *       - Credit-card numbers redacted ONLY when Luhn-valid; a Luhn-invalid

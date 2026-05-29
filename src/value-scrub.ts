@@ -6,7 +6,7 @@
  * fields; this module catches PII that leaks into *free-text values*
  * (an exception message, a log line, breadcrumb text, etc).
  *
- * Layering (Sentry data-scrubbing parity):
+ * Layering (data-scrubbing model):
  *
  *   A) ALWAYS scrub — regardless of `sendDefaultPii`. High-risk
  *      financial / identity data that is never legitimately wanted in
@@ -18,8 +18,8 @@
  *        - US SSN: `\d{3}-\d{2}-\d{4}` — the hyphens are REQUIRED. Bare
  *          nine-digit numbers are deliberately NOT matched.
  *
- *   B) Scrub UNLESS `sendDefaultPii === true` (default false = Sentry
- *      parity). When the host opts into PII these are left intact:
+ *   B) Scrub UNLESS `sendDefaultPii === true` (default false, the
+ *      privacy-safe default). When the host opts into PII these are left intact:
  *        - Email addresses.
  *        - IPv4 addresses (octets validated 0–255).
  *
@@ -49,7 +49,7 @@ export interface ValueScrubOptions {
   /**
    * When true the host has opted into PII: the (B) value scrubbers
    * (email + IPv4) are DISABLED. The (A) scrubbers (CC + SSN) always run.
-   * Default false (Sentry parity).
+   * Default false (the privacy-safe default).
    */
   sendDefaultPii?: boolean;
   /** Caller-supplied patterns, always applied. */

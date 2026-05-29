@@ -27,7 +27,7 @@ const PATH_END = '/ingest/v1/sessions/end';
 
 /**
  * Lifecycle status of a release-health session. Vocabulary matches the AllStak
- * backend `/ingest/v1/sessions/end` contract and Sentry release-health:
+ * backend `/ingest/v1/sessions/end` contract for release-health:
  *   - `ok`       — ended normally with at most non-fatal logs.
  *   - `errored`  — at least one HANDLED error landed; the process kept running.
  *   - `crashed`  — an UNHANDLED / fatal exception ended the app.

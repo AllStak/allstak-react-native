@@ -5,7 +5,7 @@
  * outage. When an event cannot be delivered (network error, retries exhausted,
  * offline, or the app shutting down with events still buffered) the SDK writes
  * the (already PII-scrubbed) payload to a persistent store instead of dropping
- * it, then replays it on the next init. This mirrors @sentry's offline store /
+ * it, then replays it on the next init. This is an offline store /
  * envelope cache, adapted to RN.
  *
  * RN ships no bundled native filesystem, so persistence is a PLUGGABLE adapter

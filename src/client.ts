@@ -59,7 +59,7 @@ declare const require: undefined | ((id: string) => { AsyncLocalStorage?: new ()
 
 export const INGEST_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = 'allstak-react-native';
-export const SDK_VERSION = '0.6.0';
+export const SDK_VERSION = '0.6.1';
 
 export { Scope } from './scope';
 export { Span, TracingModule } from './tracing';
@@ -284,7 +284,7 @@ export interface AllStakConfig {
   captureScreenContext?: boolean;
   /**
    * Opt into sending personally-identifiable information. Default FALSE
-   * (Sentry parity). Two effects:
+   * (the privacy-safe default). Two effects:
    *   - The explicit user object's `email` / `ip_address` are attached to
    *     events (see {@link buildUserContext}).
    *   - The value-pattern scrubbers for email + IPv4 in free-text values
@@ -1688,7 +1688,7 @@ export class AllStakClient {
    * event. Returns a shallow-copied payload with scrubbed fields.
    *
    * Deliberately does NOT touch: the explicit `user` object (intentional
-   * identification, Sentry-parity), stack frames (filename/function/absPath),
+   * identification), stack frames (filename/function/absPath),
    * release / sdk / environment / platform / service fields, span/operation
    * names, URLs/paths (own redactor), tags (filter/index keys), and the
    * SDK's own `sessionId` / trace ids.

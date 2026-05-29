@@ -2,10 +2,15 @@
 
 All notable public changes to `@allstak/react-native` are documented here.
 
-## Unreleased
+## 0.6.1 - 2026-05-30
 
-Feature waves landed since `v0.5.11`. Version number unchanged pending the
-release gate.
+- Documentation and inline-comment cleanup across the session, persistence, and
+  value-scrubbing modules; no public API, wire-format, or runtime behavior
+  changes. Rebuilt `dist` and synced the SDK version constant.
+
+## 0.6.0 - 2026-05-29
+
+Feature waves landed since `v0.5.11`.
 
 ### Added
 
@@ -24,8 +29,7 @@ release gate.
   `scrubString` / `scrubValueTree` (`value-scrub.ts`, `ValueScrubOptions`)
   redact credit-card, SSN, email, and IP patterns in free-text fields,
   breadcrumbs, log messages, and HTTP bodies by default. A `sendDefaultPii`
-  flag (default `false`,-compatible) opts back into capturing the
-  lower-risk categories.
+  flag (default `false`) opts back into capturing the lower-risk categories.
 - **Android NDK / native-signal crash capture.** A new async-signal-safe native
   handler (`allstak_signal_handler.cpp`, `AllStakNdk.java`, CMake build) captures
   POSIX/NDK signal crashes (SIGSEGV / SIGABRT / SIGBUS / SIGILL / SIGFPE /
