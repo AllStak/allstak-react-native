@@ -250,7 +250,11 @@ export async function drainPendingNativeCrashes(release?: string): Promise<void>
       native = rn?.NativeModules?.AllStakNative;
     }
     if (!native) return;
-    if (typeof native.install === 'function') {
+    // Prefer the options-aware install (native-signal capture on by default);
+    // fall back to the legacy single-arg install for older native modules.
+    if (typeof native.installWithOptions === 'function') {
+      try { await native.installWithOptions(release ?? '', true); } catch { /* ignore */ }
+    } else if (typeof native.install === 'function') {
       try { await native.install(release ?? ''); } catch { /* ignore */ }
     }
     if (typeof native.drainPendingCrash === 'function') {

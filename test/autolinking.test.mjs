@@ -54,3 +54,44 @@ test('Android sourceDir + AllStakRNPackage exist on disk', () => {
   assert.ok(existsSync(join(sourceDirAbs, 'build.gradle')), 'native android build.gradle missing');
   assert.ok(existsSync(join(sourceDirAbs, 'src/main/AndroidManifest.xml')), 'AndroidManifest.xml missing');
 });
+
+test('Android NDK signal-capture build is wired (cpp + CMake + gradle + AllStakNdk)', () => {
+  const cfg = require(join(pkgRoot, 'react-native.config.js'));
+  const sourceDirAbs = join(pkgRoot, cfg.dependency.platforms.android.sourceDir);
+
+  // Native source + CMake build file the .so is built from.
+  const cpp = join(sourceDirAbs, 'src/main/cpp/allstak_signal_handler.cpp');
+  const cmake = join(sourceDirAbs, 'src/main/cpp/CMakeLists.txt');
+  assert.ok(existsSync(cpp), `native signal handler .cpp must exist: ${cpp}`);
+  assert.ok(existsSync(cmake), `CMakeLists.txt must exist: ${cmake}`);
+
+  // The handler must be async-signal-safe-by-construction: it must register
+  // sigaction handlers and write the same "ASK1" record the iOS handler uses,
+  // and expose JNI via JNI_OnLoad/RegisterNatives.
+  const cppSrc = readFileSync(cpp, 'utf8');
+  assert.match(cppSrc, /sigaction/);
+  assert.match(cppSrc, /SA_SIGINFO\s*\|\s*SA_ONSTACK/);
+  assert.match(cppSrc, /_Unwind_Backtrace/, 'must unwind via async-signal-safe libunwind');
+  assert.match(cppSrc, /JNI_OnLoad/);
+  assert.match(cppSrc, /RegisterNatives/);
+  assert.match(cppSrc, /"ASK1"|0x41.*0x53.*0x4B.*0x31/, 'must use the shared ASK1 record magic');
+
+  // CMake must produce the .so AllStakNdk loads.
+  const cmakeSrc = readFileSync(cmake, 'utf8');
+  assert.match(cmakeSrc, /add_library\(\s*allstak_signal\s+SHARED/);
+
+  // build.gradle must reference the CMake build via externalNativeBuild.
+  const gradleSrc = readFileSync(join(sourceDirAbs, 'build.gradle'), 'utf8');
+  assert.match(gradleSrc, /externalNativeBuild/);
+  assert.match(gradleSrc, /src\/main\/cpp\/CMakeLists\.txt/);
+
+  // AllStakNdk must load the matching library name and degrade gracefully.
+  const ndk = join(sourceDirAbs, 'src/main/java/io/allstak/rn/AllStakNdk.java');
+  assert.ok(existsSync(ndk), `AllStakNdk.java must exist: ${ndk}`);
+  const ndkSrc = readFileSync(ndk, 'utf8');
+  assert.match(ndkSrc, /System\.loadLibrary\("allstak_signal"\)/);
+  assert.match(ndkSrc, /native boolean nativeInstall/);
+  assert.match(ndkSrc, /android-NDKSignalHandler/);
+  // Graceful-degrade: loadLibrary failure must be caught, never thrown.
+  assert.match(ndkSrc, /catch\s*\(\s*Throwable/);
+});

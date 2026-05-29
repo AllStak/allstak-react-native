@@ -22,7 +22,30 @@ android {
   defaultConfig {
     minSdkVersion safeExtGet('minSdkVersion', 21)
     targetSdkVersion safeExtGet('targetSdkVersion', 34)
+
+    // NDK / native-signal crash handler (liballstak_signal.so). Built via the
+    // CMakeLists.txt below. AllStakNdk loads the .so with System.loadLibrary and
+    // degrades gracefully (JVM-only capture) if it is absent or fails to load,
+    // so consumers without an NDK installed are unaffected.
+    externalNativeBuild {
+      cmake {
+        cppFlags "-std=c++14"
+      }
+    }
   }
+
+  // Build the C/C++ signal handler with the package. CMake + the NDK ship with
+  // the standard Android Gradle plugin used by RN apps; if the NDK is not
+  // resolvable in a given environment the host app simply omits the .so and the
+  // SDK falls back to JVM-only crash capture (no build break for JS-only / Expo
+  // Go consumers since this module is only compiled when the native project is).
+  externalNativeBuild {
+    cmake {
+      path "src/main/cpp/CMakeLists.txt"
+      version safeExtGet('cmakeVersion', '3.22.1')
+    }
+  }
+
   compileOptions {
     sourceCompatibility JavaVersion.VERSION_17
     targetCompatibility JavaVersion.VERSION_17

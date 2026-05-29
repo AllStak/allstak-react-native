@@ -36,6 +36,7 @@ public class AllStakRNModule extends ReactContextBaseJavaModule {
     private static final double SLOW_FRAME_MS = 50.0d;
     private static final double FROZEN_FRAME_MS = 700.0d;
 
+    private volatile String lastInstallRelease = null;
     private boolean frameMonitorStarted = false;
     private long lastFrameNanos = 0L;
     private int totalFrames = 0;
@@ -75,8 +76,23 @@ public class AllStakRNModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void install(String release, Promise promise) {
+        installInternal(release, true, promise);
+    }
+
+    /**
+     * Overload that lets JS independently disable the NDK / native-signal
+     * handler while keeping JVM capture. {@code captureNativeSignals} defaults
+     * to true on the single-arg path above so existing consumers are unchanged.
+     */
+    @ReactMethod
+    public void installWithOptions(String release, boolean captureNativeSignals, Promise promise) {
+        installInternal(release, captureNativeSignals, promise);
+    }
+
+    private void installInternal(String release, boolean captureNativeSignals, Promise promise) {
         try {
-            AllStakCrashHandler.install(getReactApplicationContext(), release);
+            lastInstallRelease = release;
+            AllStakCrashHandler.install(getReactApplicationContext(), release, captureNativeSignals);
             ensureFrameMonitorStarted();
             promise.resolve(true);
         } catch (Throwable t) {
@@ -109,7 +125,8 @@ public class AllStakRNModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void drainPendingCrash(Promise promise) {
         try {
-            String json = AllStakCrashHandler.drainPendingCrash(getReactApplicationContext());
+            String json = AllStakCrashHandler.drainPendingCrash(
+                getReactApplicationContext(), lastInstallRelease);
             promise.resolve(json);
         } catch (Throwable t) {
             promise.reject("drain-failed", t);

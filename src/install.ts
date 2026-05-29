@@ -58,9 +58,19 @@ export interface ReactNativeInstallOptions {
    * where the native module is unavailable.
    */
   autoNativeCrashHandling?: boolean;
+  /**
+   * Capture native NDK / POSIX-signal crashes (SIGSEGV/SIGABRT/SIGBUS/SIGILL/
+   * SIGFPE/SIGTRAP) from JNI, C/C++, the NDK, or the JSI/Hermes engine via the
+   * async-signal-safe native handler — the dominant class of native crashes
+   * the JVM/Obj-C handlers never see. Default: true. Requires
+   * `autoNativeCrashHandling`. Degrades gracefully (JVM/Obj-C-only capture)
+   * when the native signal library is absent or fails to load. Maps to the
+   * native module's `installWithOptions(release, captureNativeSignals)`.
+   */
+  captureNativeSignals?: boolean;
 }
 
-async function installAndDrainNativeCrashes(): Promise<void> {
+async function installAndDrainNativeCrashes(captureNativeSignals: boolean): Promise<void> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const rn = require('react-native');
@@ -68,7 +78,12 @@ async function installAndDrainNativeCrashes(): Promise<void> {
     if (!native) return;
 
     const release = AllStak.getConfig()?.release ?? '';
-    if (typeof native.install === 'function') {
+    // Prefer the options-aware install so JS can toggle native-signal capture
+    // without dropping JVM/Obj-C capture; fall back to the legacy single-arg
+    // install for older native modules (which always capture native signals).
+    if (typeof native.installWithOptions === 'function') {
+      try { await native.installWithOptions(release, captureNativeSignals); } catch { /* ignore */ }
+    } else if (typeof native.install === 'function') {
       try { await native.install(release); } catch { /* ignore */ }
     }
     if (typeof native.drainPendingCrash !== 'function') return;
@@ -181,7 +196,7 @@ export function installReactNative(options: ReactNativeInstallOptions = {}): voi
   }
 
   if (options.autoNativeCrashHandling !== false) {
-    void installAndDrainNativeCrashes();
+    void installAndDrainNativeCrashes(options.captureNativeSignals !== false);
   }
 
   if (options.autoFetchBreadcrumbs !== false) {

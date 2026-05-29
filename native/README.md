@@ -28,11 +28,39 @@ Both are gated by the JS `autoNativeCrashHandling` option (the native
 
 ## Android crash capture
 
-Android currently captures **JVM `Throwable`s** only
-(`Thread.UncaughtExceptionHandler`). Native (NDK / C++ / JSI) `SIGSEGV`/`SIGABRT`
-signal + tombstone capture is a deliberate **follow-up** — it requires an
-async-signal-safe NDK handler and is intentionally not partially implemented.
-See `AllStakSignalCrashHandler.m` for the iOS reference approach to port.
+The Android native module captures two classes of crash and drains them on the
+next launch (`drainPendingCrash` → `/ingest/v1/errors` with `native.crash=true`):
+
+1. **JVM `Throwable`** via `Thread.UncaughtExceptionHandler`
+   (`AllStakCrashHandler`).
+2. **NDK / POSIX signals** — `SIGSEGV` / `SIGABRT` / `SIGBUS` / `SIGILL` /
+   `SIGFPE` / `SIGTRAP` — via an async-signal-safe `sigaction` handler on an
+   alternate signal stack, compiled into `liballstak_signal.so`
+   (`src/main/cpp/allstak_signal_handler.cpp`, JNI-registered via
+   `JNI_OnLoad`/`RegisterNatives` against `AllStakNdk`). This covers the
+   dominant class of real native Android crashes (bad memory access from JNI,
+   C/C++ libs, the NDK, or the JSI/Hermes engine) which never raise a JVM
+   `Throwable` (the kernel kills the process; `debuggerd` writes a
+   `/data/tombstones/` entry). The handler writes a fixed binary record — the
+   SAME `"ASK1"`/v1 little-endian format the iOS handler uses — to a pre-opened
+   fd under the app `filesDir`, then restores the previous disposition and
+   re-raises so the OS tombstone and other reporters still run. On the next
+   launch `AllStakNdk.drainPendingSignalCrash` parses it (in normal context)
+   into the same JSON payload the `Throwable` path produces.
+
+Native-signal capture is built with the package via CMake
+(`externalNativeBuild`) and is **fail-open**: if the NDK library is absent or
+fails to load (no NDK in the consumer build, unsupported ABI), `AllStakNdk`
+no-ops and JVM-only capture continues. It is gated by the JS
+`autoNativeCrashHandling` option (native `install` is only called when enabled)
+plus the `captureNativeSignals` option (default true), which maps to the native
+module's `installWithOptions(release, captureNativeSignals)`.
+
+> The async-signal-safe signal handler is **device-verification-only**: a real
+> SIGSEGV/SIGABRT on a device/emulator is the only true end-to-end test. The
+> binary record format and its parse/convert are unit-tested in JS
+> (`test/android-signal-record.test.mjs`), and the C/C++ source is verified to
+> compile + link against the NDK sysroot for all four ABIs.
 
 Install the package, add the Expo plugin when using Expo, then rebuild the native app:
 

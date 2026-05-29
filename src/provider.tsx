@@ -170,6 +170,8 @@ export function AllStakProvider({
   autoFetchBreadcrumbs,
   autoConsoleBreadcrumbs,
   autoNavigationBreadcrumbs,
+  autoNativeCrashHandling,
+  captureNativeSignals,
   captureScreenshotOnError,
   screenshotRedaction,
   screenshotMaskStyle,
@@ -257,6 +259,8 @@ export function AllStakProvider({
         autoFetchBreadcrumbs,
         autoConsoleBreadcrumbs,
         autoNavigationBreadcrumbs,
+        autoNativeCrashHandling,
+        captureNativeSignals,
         debugLogs: debug,
       });
 
