@@ -24,7 +24,7 @@ release gate.
   `scrubString` / `scrubValueTree` (`value-scrub.ts`, `ValueScrubOptions`)
   redact credit-card, SSN, email, and IP patterns in free-text fields,
   breadcrumbs, log messages, and HTTP bodies by default. A `sendDefaultPii`
-  flag (default `false`, Sentry-compatible) opts back into capturing the
+  flag (default `false`,-compatible) opts back into capturing the
   lower-risk categories.
 - **Android NDK / native-signal crash capture.** A new async-signal-safe native
   handler (`allstak_signal_handler.cpp`, `AllStakNdk.java`, CMake build) captures
